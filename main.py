@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
+# Database Imports
 from database import engine, Base, get_db
 from models import UserDB, CourseDB, StudentDB, PublicationDB, ProjectDB, InterestDB
 from schemas import (
@@ -22,11 +23,7 @@ from schemas import (
 
 # AI & Presentation Libraries
 from groq import Groq
-from pptx import Presentation
-from pptx.util import Inches, Pt
-from pptx.dml.color import RGBColor
-from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
-from pptx.enum.shapes import MSO_SHAPE
+from services.pptx_service import create_pptx
 
 load_dotenv()
 Base.metadata.create_all(bind=engine)
@@ -42,8 +39,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 2. Free High-Speed AI Engine (Unlimited Access) ---
-# Get your free key at https://console.groq.com/
+# --- 2. Free High-Speed AI Engine ---
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # --- 3. Professional Theme System ---
@@ -55,8 +51,11 @@ THEMES = {
 }
 
 def clean_markdown(text: str) -> str:
-    """Removes markdown formatting for clean slide text."""
-    return re.sub(r'\*\*(.*?)\*\*', r'\1', str(text)).replace('*', '').strip()
+    """Removes markdown and cleans strings for PPTX safety."""
+    text_str = str(text)
+    # Remove markdown bolding and stars
+    text_str = re.sub(r'\*\*(.*?)\*\*', r'\1', text_str).replace('*', '')
+    return text_str.strip()
 
 # --- 4. User Authentication & Profile ---
 @app.post("/register")
@@ -84,11 +83,9 @@ def login_user(user: UserLogin, db: Session = Depends(get_db)):
 def get_profile(user_id: int, db: Session = Depends(get_db)):
     user = db.query(UserDB).filter(UserDB.id == user_id).first()
     if not user: raise HTTPException(status_code=404, detail="User not found")
-    
     pubs = db.query(PublicationDB).filter(PublicationDB.user_id == user_id).all()
     courses = db.query(CourseDB).filter(CourseDB.user_id == user_id).all()
     projects = db.query(ProjectDB).filter(ProjectDB.user_id == user_id).all()
-    
     return {
         "id": user.id, "full_name": user.full_name, "bio": user.bio, "department": user.department,
         "metrics": {
@@ -99,7 +96,7 @@ def get_profile(user_id: int, db: Session = Depends(get_db)):
         "publications": pubs, "courses": courses, "projects": projects
     }
 
-# --- 5. Course & Student Excel Uploads ---
+# --- 5. Excel Student Upload Logic ---
 @app.post("/courses-with-students")
 async def create_course_with_excel(
     user_id: int = Form(...), code: str = Form(...), name: str = Form(...), 
@@ -111,14 +108,12 @@ async def create_course_with_excel(
     if file and file.filename:
         df = pd.read_excel(io.BytesIO(await file.read()))
         student_count = len(df)
-        
     new_course = CourseDB(
         user_id=user_id, code=code, name=name, semester=semester, 
         students=student_count, status="active", schedule=schedule, room=room
     )
     db.add(new_course)
     db.flush() 
-    
     if df is not None:
         for _, row in df.iterrows():
             db.add(StudentDB(
@@ -132,22 +127,40 @@ async def create_course_with_excel(
 def get_courses(user_id: int, db: Session = Depends(get_db)):
     return db.query(CourseDB).filter(CourseDB.user_id == user_id).all()
 
-# --- 6. AI Lecture Generation (Unlimited Free Tier) ---
+# --- 6. AI Lecture Generation (Updated for Structured Bullets) ---
 @app.post("/api/generate-lecture")
 async def generate_lecture(data: LectureRequest):
     prompt = f"""
     Act as a University Professor. Topic: {data.topic}. Level: {data.course_level}. 
-    Slides: {data.pages_count}. Theme: {data.theme}. Instructions: {data.additional_instructions}.
-    Output strictly valid JSON with keys: "slides" [title, content[], speaker_notes].
+    Slides: {data.pages_count}. Theme: {data.theme}. 
+    Instructions: {data.additional_instructions}.
+    
+    CRITICAL STRUCTURE RULES:
+    1. Output strictly valid JSON.
+    2. "content" MUST be a LIST of strings (bullet points).
+    3. Each bullet point should be concise (max 20 words).
+    4. Provide 4 to 6 bullet points per slide.
+    5. NO long paragraphs inside the content list.
+    
+    Format: 
+    {{ 
+      "slides": [ 
+        {{ 
+          "title": "Title of Slide", 
+          "content": ["Point 1", "Point 2", "Point 3", "Point 4"], 
+          "speaker_notes": "Deep technical explanation for the professor." 
+        }} 
+      ] 
+    }}
     """
     try:
-        # Llama 3.3 70B provides PhD-level logic for free with high rate limits
         completion = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": "JSON-only academic generator."}, 
+            messages=[{"role": "system", "content": "You are a professional JSON lecture generator. You always return content as a list of bullet points."}, 
                       {"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )
+        # Parse and return
         return json.loads(completion.choices[0].message.content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -156,51 +169,7 @@ async def generate_lecture(data: LectureRequest):
 @app.post("/api/export-pptx")
 async def export_pptx(data: dict):
     try:
-        theme = THEMES.get(data.get('theme'), THEMES['Modern Minimalist'])
-        prs = Presentation()
-        prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5) 
-
-        for i, slide_data in enumerate(data.get('slides', [])):
-            slide = prs.slides.add_slide(prs.slide_layouts[6])
-            
-            # Apply Background Theme
-            slide.background.fill.solid()
-            slide.background.fill.fore_color.rgb = RGBColor.from_string(theme["bg"])
-            
-            # Design: Professional Accent Bar
-            bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(0.12), Inches(7.5))
-            bar.fill.solid()
-            bar.fill.fore_color.rgb = RGBColor.from_string(theme["accent"])
-            bar.line.fill.background()
-
-            is_title = (i == 0)
-            
-            # Title Layout Logic
-            top = Inches(2.5) if is_title else Inches(0.5)
-            title_box = slide.shapes.add_textbox(Inches(0.8), top, Inches(11.5), Inches(1.5))
-            tf = title_box.text_frame
-            p = tf.paragraphs[0]
-            p.text = clean_markdown(slide_data.get("title", "Untitled")).upper() if is_title else clean_markdown(slide_data.get("title", "Untitled"))
-            p.font.size = Pt(54) if is_title else Pt(40)
-            p.font.bold = True
-            p.font.color.rgb = RGBColor.from_string(theme["accent"])
-            if is_title: p.alignment = PP_ALIGN.CENTER
-
-            # Content Layout Logic
-            if not is_title:
-                body_box = slide.shapes.add_textbox(Inches(0.8), Inches(1.8), Inches(11.5), Inches(4.8))
-                body_tf = body_box.text_frame
-                body_tf.word_wrap = True
-                for point in slide_data.get("content", []):
-                    p = body_tf.add_paragraph()
-                    p.text = f"• {clean_markdown(point)}"
-                    p.font.size = Pt(22)
-                    p.font.color.rgb = RGBColor.from_string(theme["text"])
-                    p.space_after = Pt(12)
-
-        stream = io.BytesIO()
-        prs.save(stream)
-        stream.seek(0)
-        return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        # data should already contain the list of slides with "content" as a list
+        return StreamingResponse(create_pptx(data), media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
