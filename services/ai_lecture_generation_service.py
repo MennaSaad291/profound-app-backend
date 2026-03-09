@@ -47,7 +47,6 @@ Each slide must contain:
 - 4 to 6 bullet points
 - each bullet must be short
 - maximum 18 words per bullet
-- no long paragraphs
 
 3. Academic Quality
 

@@ -1,5 +1,6 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Text
 from database import Base
+from sqlalchemy import Column, String, Integer, Text, ForeignKey, Boolean, DateTime, TIMESTAMP, JSON
+import datetime
 
 class UserDB(Base):
     __tablename__ = "users"
@@ -48,3 +49,24 @@ class InterestDB(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     name = Column(String)
+    
+class ExamDB(Base):
+    __tablename__ = "exams"
+    id = Column(String(50), primary_key=True)
+    # nullable=True allows exams to be generated without being linked to a specific course
+    course_id = Column(Integer, ForeignKey("courses.id", ondelete="SET NULL"), nullable=True)
+    title = Column(String(255))
+    created_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+    is_variation = Column(Boolean, default=False)
+
+class QuestionDB(Base):
+    __tablename__ = "questions"
+    id = Column(String(50), primary_key=True)
+    exam_id = Column(String(50), ForeignKey("exams.id", ondelete="CASCADE"))
+    question_text = Column(Text)
+    question_type = Column(String(50)) # e.g., 'MCQ' or 'Essay'
+    options = Column(JSON, nullable=True) # Essential for MCQ storage
+    blooms_level = Column(String(50)) # Pedagogical alignment
+    difficulty = Column(String(20))
+    correct_answer = Column(Text)
+    explanation = Column(Text)
