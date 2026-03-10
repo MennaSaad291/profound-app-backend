@@ -15,23 +15,16 @@ class UserUpdate(BaseModel):
     bio: str
     department: str
 
-<<<<<<< HEAD
-# --- Change Password Schema ---
 class ChangePasswordRequest(BaseModel):
     user_id: int
     current_password: str
     new_password: str
 
-# --- Verify Password Schema ---
 class VerifyPasswordRequest(BaseModel):
     user_id: int
     password: str
 
-# --- Profile Metric Schemas ---
-class PublicationCreate(BaseModel): 
-=======
 class PublicationCreate(BaseModel):
->>>>>>> origin/main
     user_id: int
     title: str
     journal: str
@@ -59,7 +52,6 @@ class CourseResponse(BaseModel):
     schedule: Optional[str]
     room: Optional[str]
     progress: Optional[int]
-
     class Config:
         from_attributes = True
 
@@ -67,7 +59,6 @@ class ExamRequest(BaseModel):
     topic: str
     course_id: Optional[int] = None
     content_text: Optional[str] = None
-    # ✅ Enforce exact count on backend
     number_of_questions: int = Field(default=5, ge=1, le=50)
     difficulty: str = "Medium"
     blooms_level: str = "Apply"
