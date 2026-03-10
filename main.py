@@ -17,7 +17,8 @@ from models import UserDB, CourseDB, StudentDB, PublicationDB, ProjectDB, Intere
 from schemas import (
     UserCreate, UserLogin, UserUpdate, 
     LectureRequest, CourseResponse, 
-    PublicationCreate, ProjectCreate, InterestCreate
+    PublicationCreate, ProjectCreate, InterestCreate,
+    ChangePasswordRequest, VerifyPasswordRequest
 )
 
 # AI & Presentation Libraries
@@ -43,7 +44,6 @@ app.add_middleware(
 )
 
 # --- 2. Free High-Speed AI Engine (Unlimited Access) ---
-# Get your free key at https://console.groq.com/
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # --- 3. Professional Theme System ---
@@ -90,7 +90,7 @@ def get_profile(user_id: int, db: Session = Depends(get_db)):
     projects = db.query(ProjectDB).filter(ProjectDB.user_id == user_id).all()
     
     return {
-        "id": user.id, "full_name": user.full_name, "bio": user.bio, "department": user.department,
+        "id": user.id, "full_name": user.full_name, "email": user.email, "bio": user.bio, "department": user.department,
         "metrics": {
             "citations": sum(p.citations for p in pubs),
             "students": sum(c.students for c in courses),
@@ -99,7 +99,54 @@ def get_profile(user_id: int, db: Session = Depends(get_db)):
         "publications": pubs, "courses": courses, "projects": projects
     }
 
-# --- 5. Course & Student Excel Uploads ---
+@app.post("/verify-password")
+def verify_password(data: VerifyPasswordRequest, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.id == data.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not bcrypt.checkpw(data.password.encode('utf-8'), user.password_hash.encode('utf-8')):
+        raise HTTPException(status_code=401, detail="Incorrect password")
+    return {"message": "Password verified"}
+
+
+@app.put("/profile/{user_id}")
+def update_profile(user_id: int, data: UserUpdate, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.full_name = data.full_name
+    user.bio = data.bio
+    user.department = data.department
+    db.commit()
+    return {"message": "Profile updated successfully"}
+
+
+@app.post("/change-password")
+def change_password(data: ChangePasswordRequest, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.id == data.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Verify current password
+    if not bcrypt.checkpw(data.current_password.encode('utf-8'), user.password_hash.encode('utf-8')):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    
+    # Check new password is different from current
+    if data.current_password == data.new_password:
+        raise HTTPException(status_code=400, detail="New password must be different from current password")
+
+    # Validate new password length
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+    
+    # Hash and save new password
+    salt = bcrypt.gensalt()
+    user.password_hash = bcrypt.hashpw(data.new_password.encode('utf-8'), salt).decode('utf-8')
+    db.commit()
+    
+    return {"message": "Password updated successfully"}
+
+# --- 6. Course & Student Excel Uploads ---
 @app.post("/courses-with-students")
 async def create_course_with_excel(
     user_id: int = Form(...), code: str = Form(...), name: str = Form(...), 
@@ -132,7 +179,7 @@ async def create_course_with_excel(
 def get_courses(user_id: int, db: Session = Depends(get_db)):
     return db.query(CourseDB).filter(CourseDB.user_id == user_id).all()
 
-# --- 6. AI Lecture Generation (Unlimited Free Tier) ---
+# --- 7. AI Lecture Generation ---
 @app.post("/api/generate-lecture")
 async def generate_lecture(data: LectureRequest):
     prompt = f"""
@@ -141,7 +188,6 @@ async def generate_lecture(data: LectureRequest):
     Output strictly valid JSON with keys: "slides" [title, content[], speaker_notes].
     """
     try:
-        # Llama 3.3 70B provides PhD-level logic for free with high rate limits
         completion = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": "JSON-only academic generator."}, 
@@ -152,7 +198,7 @@ async def generate_lecture(data: LectureRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 7. Professional PPTX Designer Engine ---
+# --- 8. Professional PPTX Designer Engine ---
 @app.post("/api/export-pptx")
 async def export_pptx(data: dict):
     try:
@@ -163,11 +209,9 @@ async def export_pptx(data: dict):
         for i, slide_data in enumerate(data.get('slides', [])):
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             
-            # Apply Background Theme
             slide.background.fill.solid()
             slide.background.fill.fore_color.rgb = RGBColor.from_string(theme["bg"])
             
-            # Design: Professional Accent Bar
             bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(0.12), Inches(7.5))
             bar.fill.solid()
             bar.fill.fore_color.rgb = RGBColor.from_string(theme["accent"])
@@ -175,7 +219,6 @@ async def export_pptx(data: dict):
 
             is_title = (i == 0)
             
-            # Title Layout Logic
             top = Inches(2.5) if is_title else Inches(0.5)
             title_box = slide.shapes.add_textbox(Inches(0.8), top, Inches(11.5), Inches(1.5))
             tf = title_box.text_frame
@@ -186,7 +229,6 @@ async def export_pptx(data: dict):
             p.font.color.rgb = RGBColor.from_string(theme["accent"])
             if is_title: p.alignment = PP_ALIGN.CENTER
 
-            # Content Layout Logic
             if not is_title:
                 body_box = slide.shapes.add_textbox(Inches(0.8), Inches(1.8), Inches(11.5), Inches(4.8))
                 body_tf = body_box.text_frame

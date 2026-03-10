@@ -16,6 +16,17 @@ class UserUpdate(BaseModel):
     bio: str
     department: str
 
+# --- Change Password Schema ---
+class ChangePasswordRequest(BaseModel):
+    user_id: int
+    current_password: str
+    new_password: str
+
+# --- Verify Password Schema ---
+class VerifyPasswordRequest(BaseModel):
+    user_id: int
+    password: str
+
 # --- Profile Metric Schemas ---
 class PublicationCreate(BaseModel): 
     user_id: int
