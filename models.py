@@ -70,3 +70,13 @@ class QuestionDB(Base):
     difficulty = Column(String(20))
     correct_answer = Column(Text)
     explanation = Column(Text)
+
+class SubmissionDB(Base):
+    __tablename__ = "submissions"
+    id = Column(Integer, primary_key=True, index=True)
+    student_name = Column(String)
+    submission_time = Column(String)
+    status = Column(String, default="pending") # 'pending', 'ready', 'graded'
+    ai_grade = Column(Integer, nullable=True)
+    plagiarism_score = Column(Integer, nullable=True)
+    essay_content = Column(Text, nullable=True)

@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from database import engine, Base, get_db
 from models import (UserDB, CourseDB, StudentDB, PublicationDB,
-                    ProjectDB, InterestDB, ExamDB, QuestionDB)
+                    ProjectDB, InterestDB, ExamDB, QuestionDB, SubmissionDB)
 from schemas import (UserCreate, UserLogin, UserUpdate,
                     LectureRequest, CourseResponse, ExamRequest,
                     ExamResponse, Question,
@@ -23,6 +23,13 @@ from schemas import (UserCreate, UserLogin, UserUpdate,
 
 from groq import Groq
 from docx import Document
+
+from fastapi import FastAPI, UploadFile, File
+import shutil
+from grading import grade_text
+from plagiarism import plagiarism_score
+from file_utils import extract_text
+from datetime import datetime
 
 try:
     from services.pptx_service import create_pptx
@@ -48,6 +55,91 @@ def clean_markdown(text: str) -> str:
     text_str = str(text)
     return re.sub(r'\*\*(.*?)\*\*', r'\1', text_str).replace('*', '').strip()
 
+#submission------------
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+
+@app.post("/grade")
+async def grade_files(
+    files: list[UploadFile] = File(...),
+    db: Session = Depends(get_db)
+):
+
+    results = []
+
+    for file in files:
+
+        file_path = f"{UPLOAD_DIR}/{file.filename}"
+
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        text = extract_text(file_path)
+
+        ai_grade = grade_text(text)
+        plagiarism = plagiarism_score(text)
+
+        new_submission = SubmissionDB(
+            student_name=file.filename,
+            submission_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            status="ready",
+            ai_grade=ai_grade,
+            plagiarism_score=plagiarism,
+            essay_content=text
+        )
+
+        db.add(new_submission)
+        db.commit()
+        db.refresh(new_submission)
+
+        results.append({
+            "file": file.filename,
+            "grade": ai_grade,
+            "plagiarism": plagiarism
+        })
+
+    return {
+        "status": "success",
+        "results": results
+    }
+
+@app.get("/submissions")
+def get_submissions(db: Session = Depends(get_db)):
+    submissions = db.query(SubmissionDB).all()
+
+    return [
+        {
+            "id": s.id,
+            "student_name": s.student_name,
+            "submission_time": s.submission_time,
+            "status": s.status,
+            "ai_grade": s.ai_grade,
+            "plagiarism_score": s.plagiarism_score
+        }
+        for s in submissions
+    ]
+
+
+from pydantic import BaseModel
+
+
+class GradeUpdate(BaseModel):
+    ai_grade: int
+    status: str
+
+@app.put("/api/submissions/{submission_id}")
+def update_submission_grade(submission_id: int, data: GradeUpdate, db: Session = Depends(get_db)):
+    submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    submission.ai_grade = data.ai_grade
+    submission.status = data.status
+    db.commit()
+    return {"message": "Grade updated successfully"}
 # --- Auth & Profile ---
 @app.post("/register")
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
@@ -239,3 +331,32 @@ async def generate_lecture(data: LectureRequest):
 @app.get("/professors/{user_id}/courses", response_model=List[CourseResponse])
 def get_courses(user_id: int, db: Session = Depends(get_db)):
     return db.query(CourseDB).filter(CourseDB.user_id == user_id).all()
+
+
+@app.post("/api/grade-essay/{submission_id}")
+async def grade_essay(submission_id: int, db: Session = Depends(get_db)):
+    submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    prompt = f"""
+    Act as a professor. Grade this essay on a scale of 0-100. 
+    Return ONLY a JSON object with keys "score" (int) and "feedback" (string).
+    Essay: {submission.essay_content}
+    """
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        ai_result = json.loads(completion.choices[0].message.content)
+
+        submission.ai_grade = ai_result.get("score")
+        submission.status = "ready"
+        db.commit()
+
+        return {"status": "success", "grade": submission.ai_grade}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
