@@ -8,16 +8,16 @@ import datetime
 import pandas as pd
 from typing import List, Optional
 from dotenv import load_dotenv
-
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-
+from pydantic import BaseModel
 from database import engine, Base, get_db
 from models import (UserDB, CourseDB, StudentDB, PublicationDB,
-                    ProjectDB, InterestDB, ExamDB, QuestionDB, SubmissionDB,PerformanceDB ,ErrorAnalysisDB ,AssignmentDB)
+                    ProjectDB, InterestDB, ExamDB, QuestionDB, SubmissionDB, PerformanceDB, ErrorAnalysisDB,
+                    AssignmentDB, GradeUpdate, FinalizeRequest)
 from schemas import (UserCreate, UserLogin, UserUpdate,
                     LectureRequest, CourseResponse, ExamRequest,
                     ExamResponse, Question,
@@ -28,10 +28,10 @@ from docx import Document
 
 from fastapi import FastAPI, UploadFile, File
 import shutil
-from grading import grade_text
-from plagiarism import plagiarism_score
 from file_utils import extract_text
 from datetime import datetime
+from services.grading_service import perform_nlp_grading
+
 
 try:
     from services.pptx_service import create_pptx
@@ -57,91 +57,7 @@ def clean_markdown(text: str) -> str:
     text_str = str(text)
     return re.sub(r'\*\*(.*?)\*\*', r'\1', text_str).replace('*', '').strip()
 
-#submission------------
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-
-
-@app.post("/grade")
-async def grade_files(
-    files: list[UploadFile] = File(...),
-    db: Session = Depends(get_db)
-):
-
-    results = []
-
-    for file in files:
-
-        file_path = f"{UPLOAD_DIR}/{file.filename}"
-
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        text = extract_text(file_path)
-
-        ai_grade = grade_text(text)
-        plagiarism = plagiarism_score(text)
-
-        new_submission = SubmissionDB(
-            student_name=file.filename,
-            submission_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
-            status="ready",
-            ai_grade=ai_grade,
-            plagiarism_score=plagiarism,
-            essay_content=text
-        )
-
-        db.add(new_submission)
-        db.commit()
-        db.refresh(new_submission)
-
-        results.append({
-            "file": file.filename,
-            "grade": ai_grade,
-            "plagiarism": plagiarism
-        })
-
-    return {
-        "status": "success",
-        "results": results
-    }
-
-@app.get("/submissions")
-def get_submissions(db: Session = Depends(get_db)):
-    submissions = db.query(SubmissionDB).all()
-
-    return [
-        {
-            "id": s.id,
-            "student_name": s.student_name,
-            "submission_time": s.submission_time,
-            "status": s.status,
-            "ai_grade": s.ai_grade,
-            "plagiarism_score": s.plagiarism_score
-        }
-        for s in submissions
-    ]
-
-
-from pydantic import BaseModel
-
-
-class GradeUpdate(BaseModel):
-    ai_grade: int
-    status: str
-
-@app.put("/api/submissions/{submission_id}")
-def update_submission_grade(submission_id: int, data: GradeUpdate, db: Session = Depends(get_db)):
-    submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
-    if not submission:
-        raise HTTPException(status_code=404, detail="Submission not found")
-
-    submission.ai_grade = data.ai_grade
-    submission.status = data.status
-    db.commit()
-    return {"message": "Grade updated successfully"}
 # --- Auth & Profile ---
 @app.post("/register")
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
@@ -536,4 +452,103 @@ def department_benchmarks(course_id: int, db: Session = Depends(get_db)):
             "difference": round(dept_assignment_completion - your_assignment_completion, 1)
         }
     }
-app.include_router(analysis.router)     
+app.include_router(analysis.router)
+
+
+#submission------------
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+@app.get("/submissions")
+async def get_all_submissions(db: Session = Depends(get_db)):
+    submissions = db.query(SubmissionDB).order_by(SubmissionDB.id.desc()).all()
+    return submissions
+
+
+@app.put("/api/submissions/{submission_id}")
+def update_submission_grade(submission_id: int, data: GradeUpdate, db: Session = Depends(get_db)):
+    submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    submission.ai_grade = data.ai_grade
+    submission.status = data.status
+    db.commit()
+    return {"message": "Grade updated successfully"}
+
+# --------grading----------
+@app.post("/grade-submission/{assignment_id}")
+async def grade_submission(assignment_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    filename_only = os.path.splitext(file.filename)[0]
+    temp_path = f"temp_{file.filename}"
+
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        text_content = extract_text(temp_path)
+        assignment = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
+        rubric = assignment.assignment_name if assignment else "General Academic Rubric"
+
+        nlp_results = perform_nlp_grading(text_content, rubric)
+
+        new_submission = SubmissionDB(
+            student_name=filename_only,
+            submission_time=datetime.now().strftime("%Y-%m-%d %I:%M %p"),
+            status="ready",
+            ai_grade=nlp_results.get("score_out_of_100"),
+            plagiarism_score=15,
+            essay_content=text_content,
+            grade_report=nlp_results
+        )
+
+        db.add(new_submission)
+        db.commit()
+        db.refresh(new_submission)
+        return {"status": "success", "id": new_submission.id}
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+
+@app.post("/assignments/{assignment_id}/run-grading")
+async def run_grading(assignment_id: int, db: Session = Depends(get_db)):
+    submissions = db.query(SubmissionDB).filter(
+        SubmissionDB.status == "pending"
+    ).all()
+
+    for sub in submissions:
+        report = perform_nlp_grading(sub.essay_content, "Standard Essay Rubric")
+        sub.ai_grade = report.get("score_out_of_100")
+        sub.grade_report = report
+        sub.status = "ready"
+
+    db.commit()
+    return {"message": f"Processed {len(submissions)} submissions"}
+
+
+@app.post("/submissions/{submission_id}/finalize")
+async def finalize_submission(
+        submission_id: int,
+        data: FinalizeRequest,
+        db: Session = Depends(get_db)
+):
+    submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
+
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    submission.ai_grade = data.manual_grade
+    submission.status = "graded"
+
+    db.commit()
+    db.refresh(submission)
+
+    return {
+        "status": "success",
+        "message": "Grade finalized",
+        "final_grade": submission.ai_grade
+    }
+

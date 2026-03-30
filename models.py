@@ -1,6 +1,7 @@
 from database import Base
 from sqlalchemy import Column, String, Integer, Text, ForeignKey, Boolean, DateTime, TIMESTAMP, JSON ,Float ,func
 import datetime
+from pydantic import BaseModel
 
 class UserDB(Base):
     __tablename__ = "users"
@@ -72,16 +73,32 @@ class QuestionDB(Base):
     correct_answer = Column(Text)
     explanation = Column(Text)
 
+#class SubmissionDB(Base):
+#    __tablename__ = "submissions"
+#    id = Column(Integer, primary_key=True, index=True)
+#    student_name = Column(String)
+#    submission_time = Column(String)
+#    status = Column(String, default="pending") # 'pending', 'ready', 'graded'
+#    ai_grade = Column(Integer, nullable=True)
+#    plagiarism_score = Column(Integer, nullable=True)
+#    essay_content = Column(Text, nullable=True)
+
+# In models.py, update SubmissionDB
+
+
+# models.py
 class SubmissionDB(Base):
     __tablename__ = "submissions"
     id = Column(Integer, primary_key=True, index=True)
     student_name = Column(String)
     submission_time = Column(String)
-    status = Column(String, default="pending") # 'pending', 'ready', 'graded'
+    # This matches your UI's 'pending' | 'ready' | 'graded' statuses
+    status = Column(String, default="pending")
     ai_grade = Column(Integer, nullable=True)
-    plagiarism_score = Column(Integer, nullable=True)
+    plagiarism_score = Column(Integer, nullable=True) # Used for the UI color logic
     essay_content = Column(Text, nullable=True)
-    
+    grade_report = Column(JSON, nullable=True)
+
 class PerformanceDB(Base):
     __tablename__ = "performance"
     id = Column(Integer, primary_key=True)
@@ -106,4 +123,11 @@ class AssignmentDB(Base):
     student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"))
     course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"))
     assignment_name = Column(String(100))
-    is_submitted = Column(Boolean, default=False)     
+    rubric_text = Column(Text, nullable=True)
+    is_submitted = Column(Boolean, default=False)
+
+class GradeUpdate(BaseModel):
+    ai_grade: int
+    status: str
+class FinalizeRequest(BaseModel):
+    manual_grade: int

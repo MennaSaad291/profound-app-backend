@@ -3,24 +3,24 @@ import PyPDF2
 
 def extract_text(file_path):
     text = ""
-    if file_path.endswith(".txt"):
-        with open(file_path, "r", encoding="utf-8") as f:
-            return f.read()
+    try:
+        if file_path.endswith(".txt"):
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
 
-    if file_path.endswith(".docx"):
-        doc = Document(file_path)
-        return "\n".join([p.text for p in doc.paragraphs])
+        elif file_path.endswith(".docx"):
+            doc = Document(file_path)
+            text = "\n".join([p.text for p in doc.paragraphs])
 
-    if file_path.endswith(".pdf"):
-        with open(file_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
+        elif file_path.endswith(".pdf"):
+            reader = PyPDF2.PdfReader(file_path)
             for page in reader.pages:
                 page_text = page.extract_text()
                 if page_text:
-                    text += page_text
+                    text += page_text + "\n"
 
-    cleaned_text = text.replace('\x00', '')
+        return text.replace('\x00', '').strip()
 
-    return cleaned_text
-
-    return ""
+    except Exception as e:
+        print(f"Error extracting text: {e}")
+        return ""
