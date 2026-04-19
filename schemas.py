@@ -55,6 +55,26 @@ class CourseResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class ManualText(BaseModel):
+    slide: int = 1
+    text: str = ""
+
+class ManualImage(BaseModel):
+    slide: int = 1
+    filename: str = ""
+    data: str = ""      # base64
+
+class LectureRequest(BaseModel):
+    topic: str
+    course_level: str
+    pages_count: int = Field(default=10, ge=3, le=70)
+    additional_instructions: str = ""
+    include_media: bool = False
+    theme: str = "Modern Minimalist"
+    custom_sources: Optional[str] = None
+    manual_texts:  Optional[List[ManualText]]  = None
+    manual_images: Optional[List[ManualImage]] = None
+
 class ExamRequest(BaseModel):
     topic: str
     course_id: Optional[int] = None
@@ -63,16 +83,6 @@ class ExamRequest(BaseModel):
     difficulty: str = "Medium"
     blooms_level: str = "Apply"
     question_type: str = "MCQ"
-
-class LectureRequest(BaseModel):
-    topic: str
-    course_level: str
-    pages_count: int
-    additional_instructions: str = ""
-    include_media: bool = False
-    theme: str = "Modern Minimalist"
-    # Optional professor-supplied sources (comma-separated or list)
-    custom_sources: Optional[str] = None
 
 class Question(BaseModel):
     question_text: str

@@ -1,100 +1,97 @@
 """
 pptx_service.py
-Professional university lecture PowerPoint generator.
+Professional university lecture PowerPoint export.
 
-Layout per content slide:
-  ┌─────────────────────────────────────────────────────┐
-  │ ▌  SLIDE TITLE                              [  N  ] │
-  │ ═══════════════════════════════════════════════════ │
-  │                                                     │
-  │  ● Headline One                                     │
-  │    Detail explanation for headline one in 2-3       │
-  │    sentences giving depth and context.              │
-  │                                                     │
-  │  ● Headline Two                                     │
-  │    Detail explanation for headline two…             │
-  │                                                     │
-  │  ● Headline Three                                   │
-  │    Detail explanation for headline three…           │
-  │                                                     │
-  │ ┌─────────────────────────────────────────────────┐ │
-  │ │ EXAMPLE  Concrete real-world worked example…    │ │
-  │ └─────────────────────────────────────────────────┘ │
-  └─────────────────────────────────────────────────────┘
+Fixes:
+- 'str' object has no attribute 'get' — defensive handling for string and dict points
+- Pure solid colour themes — no external image files required
+- Professor images embedded from base64
+- Professor manual text shown as highlighted note box
 """
-
 import io
-import re
+import base64
+import urllib.request
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 
-# ── Theme colour palettes (no image files — pure colour) ──────────
 THEMES = {
     "Modern Minimalist": {
-        "bg":         (0xFF, 0xFF, 0xFF),
-        "accent":     (0x4F, 0x46, 0xE5),   # indigo-600
-        "accent2":    (0x7C, 0x3A, 0xED),   # violet-600
-        "title_txt":  (0x1E, 0x1B, 0x4B),   # indigo-950
-        "headline":   (0x1E, 0x1B, 0x4B),   # same deep indigo
-        "detail_txt": (0x37, 0x41, 0x51),   # gray-700
-        "ex_bg":      (0xEC, 0xFD, 0xF5),   # emerald-50
-        "ex_label":   (0x06, 0x5F, 0x46),   # emerald-900
-        "ex_txt":     (0x06, 0x5F, 0x46),
-        "dot":        (0x4F, 0x46, 0xE5),
-        "bar":        (0x4F, 0x46, 0xE5),
-        "divider":    (0xC7, 0xD2, 0xFE),   # indigo-200
-        "badge_bg":   (0x4F, 0x46, 0xE5),
-        "badge_txt":  (0xFF, 0xFF, 0xFF),
+        "bg":        (0xFF, 0xFF, 0xFF),
+        "accent":    (0x4F, 0x46, 0xE5),
+        "accent2":   (0x7C, 0x3A, 0xED),
+        "title_txt": (0x1E, 0x1B, 0x4B),
+        "headline":  (0x1E, 0x1B, 0x4B),
+        "detail":    (0x37, 0x41, 0x51),
+        "ex_bg":     (0xEC, 0xFD, 0xF5),
+        "ex_label":  (0x06, 0x5F, 0x46),
+        "ex_txt":    (0x06, 0x5F, 0x46),
+        "note_bg":   (0xFF, 0xF7, 0xED),
+        "note_txt":  (0x92, 0x40, 0x0E),
+        "dot":       (0x4F, 0x46, 0xE5),
+        "bar":       (0x4F, 0x46, 0xE5),
+        "divider":   (0xC7, 0xD2, 0xFE),
+        "badge_bg":  (0x4F, 0x46, 0xE5),
+        "badge_txt": (0xFF, 0xFF, 0xFF),
+        "ref_txt":   (0x4F, 0x46, 0xE5),
     },
     "Dark Mode Tech": {
-        "bg":         (0x0F, 0x17, 0x2A),
-        "accent":     (0x38, 0xBD, 0xF8),   # sky-400
-        "accent2":    (0x06, 0xB6, 0xD4),
-        "title_txt":  (0xF8, 0xFA, 0xFC),
-        "headline":   (0xE2, 0xE8, 0xF0),
-        "detail_txt": (0x94, 0xA3, 0xB8),   # slate-400
-        "ex_bg":      (0x0C, 0x2A, 0x2A),
-        "ex_label":   (0x34, 0xD3, 0x99),
-        "ex_txt":     (0x34, 0xD3, 0x99),
-        "dot":        (0x38, 0xBD, 0xF8),
-        "bar":        (0x38, 0xBD, 0xF8),
-        "divider":    (0x1E, 0x40, 0x4F),
-        "badge_bg":   (0x38, 0xBD, 0xF8),
-        "badge_txt":  (0x0F, 0x17, 0x2A),
+        "bg":        (0x0F, 0x17, 0x2A),
+        "accent":    (0x38, 0xBD, 0xF8),
+        "accent2":   (0x06, 0xB6, 0xD4),
+        "title_txt": (0xF8, 0xFA, 0xFC),
+        "headline":  (0xE2, 0xE8, 0xF0),
+        "detail":    (0x94, 0xA3, 0xB8),
+        "ex_bg":     (0x0C, 0x2A, 0x2A),
+        "ex_label":  (0x34, 0xD3, 0x99),
+        "ex_txt":    (0x34, 0xD3, 0x99),
+        "note_bg":   (0x1E, 0x1B, 0x0A),
+        "note_txt":  (0xFB, 0xD3, 0x4D),
+        "dot":       (0x38, 0xBD, 0xF8),
+        "bar":       (0x38, 0xBD, 0xF8),
+        "divider":   (0x1E, 0x40, 0x4F),
+        "badge_bg":  (0x38, 0xBD, 0xF8),
+        "badge_txt": (0x0F, 0x17, 0x2A),
+        "ref_txt":   (0x38, 0xBD, 0xF8),
     },
     "Classic Academic": {
-        "bg":         (0xFD, 0xFB, 0xF7),
-        "accent":     (0x80, 0x00, 0x00),   # maroon
-        "accent2":    (0xB8, 0x5C, 0x38),
-        "title_txt":  (0x3B, 0x0A, 0x0A),
-        "headline":   (0x3B, 0x0A, 0x0A),
-        "detail_txt": (0x1E, 0x1E, 0x1E),
-        "ex_bg":      (0xF0, 0xF7, 0xEE),
-        "ex_label":   (0x1A, 0x47, 0x2A),
-        "ex_txt":     (0x1A, 0x47, 0x2A),
-        "dot":        (0x80, 0x00, 0x00),
-        "bar":        (0x80, 0x00, 0x00),
-        "divider":    (0xD9, 0xC5, 0xB2),
-        "badge_bg":   (0x80, 0x00, 0x00),
-        "badge_txt":  (0xFF, 0xFF, 0xFF),
+        "bg":        (0xFD, 0xFB, 0xF7),
+        "accent":    (0x80, 0x00, 0x00),
+        "accent2":   (0xB8, 0x5C, 0x38),
+        "title_txt": (0x3B, 0x0A, 0x0A),
+        "headline":  (0x3B, 0x0A, 0x0A),
+        "detail":    (0x1E, 0x1E, 0x1E),
+        "ex_bg":     (0xF0, 0xF7, 0xEE),
+        "ex_label":  (0x1A, 0x47, 0x2A),
+        "ex_txt":    (0x1A, 0x47, 0x2A),
+        "note_bg":   (0xFD, 0xF5, 0xDD),
+        "note_txt":  (0x70, 0x3A, 0x00),
+        "dot":       (0x80, 0x00, 0x00),
+        "bar":       (0x80, 0x00, 0x00),
+        "divider":   (0xD9, 0xC5, 0xB2),
+        "badge_bg":  (0x80, 0x00, 0x00),
+        "badge_txt": (0xFF, 0xFF, 0xFF),
+        "ref_txt":   (0x80, 0x00, 0x00),
     },
     "Vibrant Creative": {
-        "bg":         (0xFF, 0xFF, 0xFF),
-        "accent":     (0xF9, 0x73, 0x16),   # orange-500
-        "accent2":    (0xEC, 0x48, 0x99),
-        "title_txt":  (0x43, 0x14, 0x07),
-        "headline":   (0x43, 0x14, 0x07),
-        "detail_txt": (0x1C, 0x1C, 0x1E),
-        "ex_bg":      (0xFD, 0xF2, 0xF8),
-        "ex_label":   (0x70, 0x1A, 0x75),
-        "ex_txt":     (0x70, 0x1A, 0x75),
-        "dot":        (0xF9, 0x73, 0x16),
-        "bar":        (0xF9, 0x73, 0x16),
-        "divider":    (0xFE, 0xD7, 0xAA),
-        "badge_bg":   (0xF9, 0x73, 0x16),
-        "badge_txt":  (0xFF, 0xFF, 0xFF),
+        "bg":        (0xFF, 0xFF, 0xFF),
+        "accent":    (0xF9, 0x73, 0x16),
+        "accent2":   (0xEC, 0x48, 0x99),
+        "title_txt": (0x43, 0x14, 0x07),
+        "headline":  (0x43, 0x14, 0x07),
+        "detail":    (0x1C, 0x1C, 0x1E),
+        "ex_bg":     (0xFD, 0xF2, 0xF8),
+        "ex_label":  (0x70, 0x1A, 0x75),
+        "ex_txt":    (0x70, 0x1A, 0x75),
+        "note_bg":   (0xFE, 0xF2, 0xC7),
+        "note_txt":  (0x92, 0x40, 0x0E),
+        "dot":       (0xF9, 0x73, 0x16),
+        "bar":       (0xF9, 0x73, 0x16),
+        "divider":   (0xFE, 0xD7, 0xAA),
+        "badge_bg":  (0xF9, 0x73, 0x16),
+        "badge_txt": (0xFF, 0xFF, 0xFF),
+        "ref_txt":   (0xF9, 0x73, 0x16),
     },
 }
 
@@ -102,12 +99,11 @@ _W = Inches(13.333)
 _H = Inches(7.5)
 
 
-def _rgb(t):
-    return RGBColor(*t)
+def _rgb(t: tuple) -> RGBColor:
+    return RGBColor(t[0], t[1], t[2])
 
 
-def _solid_rect(slide, left, top, width, height, color):
-    """Add a solid-fill rectangle with no border."""
+def _rect(slide, left, top, width, height, color: tuple):
     s = slide.shapes.add_shape(1, left, top, width, height)
     s.fill.solid()
     s.fill.fore_color.rgb = _rgb(color)
@@ -115,210 +111,291 @@ def _solid_rect(slide, left, top, width, height, color):
     return s
 
 
-def _textbox(slide, left, top, width, height, wrap=True):
+def _oval(slide, left, top, width, height, color: tuple):
+    s = slide.shapes.add_shape(9, left, top, width, height)
+    s.fill.solid()
+    s.fill.fore_color.rgb = _rgb(color)
+    s.line.fill.background()
+    return s
+
+
+def _tb(slide, left, top, width, height):
     box = slide.shapes.add_textbox(left, top, width, height)
-    tf  = box.text_frame
-    tf.word_wrap = wrap
-    return tf
+    box.text_frame.word_wrap = True
+    return box.text_frame
 
 
-def _para(tf, text, size, bold, color, align=PP_ALIGN.LEFT, space_before=0, space_after=0, italic=False):
-    """Append a paragraph to an existing text frame. First empty para is reused."""
+def _para(tf, text: str, size: float, bold: bool, color: tuple,
+          align=PP_ALIGN.LEFT, space_before: float = 0, italic: bool = False):
     if tf.paragraphs and tf.paragraphs[0].text == "":
         p = tf.paragraphs[0]
     else:
         p = tf.add_paragraph()
     run = p.add_run()
-    run.text          = str(text)
-    run.font.size     = Pt(size)
-    run.font.bold     = bold
-    run.font.italic   = italic
+    run.text           = str(text)
+    run.font.size      = Pt(size)
+    run.font.bold      = bold
+    run.font.italic    = italic
     run.font.color.rgb = _rgb(color)
-    p.alignment       = align
+    p.alignment        = align
     if space_before:
         p.space_before = Pt(space_before)
-    if space_after:
-        p.space_after  = Pt(space_after)
     return p
+
+
+def _extract_point(pt) -> tuple[str, str]:
+    """
+    Safely extract (headline, detail) from a point that may be
+    a dict OR a plain string — fixes 'str' has no attribute 'get'.
+    """
+    if isinstance(pt, str):
+        return pt.strip(), ""
+    if isinstance(pt, dict):
+        hl  = str(pt.get("headline", pt.get("title",       ""))).strip()
+        det = str(pt.get("detail",   pt.get("explanation", ""))).strip()
+        return hl, det
+    return str(pt).strip(), ""
+
+
+def _fetch_unsplash(query: str) -> bytes | None:
+    """Fetch an image from Unsplash. Returns bytes or None on failure."""
+    if not query:
+        return None
+    try:
+        clean = query.strip().replace(" ", "+")
+        url   = f"https://source.unsplash.com/featured/800x450/?{clean}"
+        req   = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            if resp.status == 200:
+                return resp.read()
+    except Exception:
+        pass
+    return None
 
 
 def create_pptx(data: dict) -> io.BytesIO:
     theme_name  = data.get("theme", "Modern Minimalist")
     c           = THEMES.get(theme_name, THEMES["Modern Minimalist"])
-    course_lvl  = data.get("course_level", "")
-
-    prs             = Presentation()
-    prs.slide_width  = _W
-    prs.slide_height = _H
-
+    course_lvl  = str(data.get("course_level", ""))
     slides_data = data.get("slides", [])
+
     if not slides_data:
         raise ValueError("No slides data provided")
 
+    prs = Presentation()
+    prs.slide_width  = _W
+    prs.slide_height = _H
+
+    _img_cache: dict[str, bytes | None] = {}
+
     for idx, sd in enumerate(slides_data):
-        slide      = prs.slides.add_slide(prs.slide_layouts[6])   # blank
-        title      = str(sd.get("title", "")).strip()
-        is_title   = (idx == 0)
-        is_ref     = any(k in title.lower() for k in ("reference", "further", "resource"))
+        # ── Defensive: sd must be a dict ─────────────────────────
+        if not isinstance(sd, dict):
+            continue
+
+        slide    = prs.slides.add_slide(prs.slide_layouts[6])
+        title    = str(sd.get("title", "Slide")).strip()
+        is_title = (idx == 0)
+        is_ref   = any(k in title.lower() for k in ("reference", "further", "resource"))
+
+        # ── Safely get all fields ─────────────────────────────────
+        raw_points  = sd.get("points", [])
+        if not isinstance(raw_points, list):
+            raw_points = []
+
+        example     = str(sd.get("example",       "") or "").strip()
+        notes       = str(sd.get("speaker_notes", "") or "").strip()
+        prof_text   = str(sd.get("professor_text","") or "").strip()
+        prof_img_d  = sd.get("professor_image")
+        if not isinstance(prof_img_d, dict):
+            prof_img_d = None
+
+        img_query = str(sd.get("image_query", sd.get("image_suggestion", "") or "") or "").strip()
+        if img_query.lower() in ("null", "none", ""):
+            img_query = ""
 
         # ── Slide background ──────────────────────────────────────
-        _solid_rect(slide, 0, 0, _W, _H, c["bg"])
-
-        # ── Left accent bar ───────────────────────────────────────
-        _solid_rect(slide, 0, 0, Inches(0.08), _H, c["bar"])
+        _rect(slide, 0, 0, _W, _H, c["bg"])
+        _rect(slide, 0, 0, Inches(0.08), _H, c["bar"])
 
         # ══════════════════════════════════════════════════════════
         # TITLE SLIDE
         # ══════════════════════════════════════════════════════════
         if is_title:
-            # Large decorative circle top-right
-            cir = slide.shapes.add_shape(9, Inches(8.8), Inches(-1.8), Inches(5.5), Inches(5.5))
-            cir.fill.solid(); cir.fill.fore_color.rgb = _rgb(c["accent"]); cir.line.fill.background()
-            cir2 = slide.shapes.add_shape(9, Inches(10.0), Inches(4.2), Inches(4.0), Inches(4.0))
-            cir2.fill.solid(); cir2.fill.fore_color.rgb = _rgb(c["accent2"]); cir2.line.fill.background()
-
-            # Title
-            tf = _textbox(slide, Inches(1.1), Inches(1.8), Inches(9.0), Inches(2.8))
-            _para(tf, title,    48, True,  c["title_txt"], PP_ALIGN.LEFT)
+            _oval(slide, Inches(8.8),  Inches(-1.8), Inches(5.5), Inches(5.5), c["accent"])
+            _oval(slide, Inches(10.0), Inches(4.2),  Inches(4.0), Inches(4.0), c["accent2"])
+            tf = _tb(slide, Inches(1.1), Inches(1.8), Inches(9.0), Inches(2.8))
+            _para(tf, title, 46, True, c["title_txt"], PP_ALIGN.LEFT)
             if course_lvl:
-                _para(tf, course_lvl, 20, False, c["accent"],    PP_ALIGN.LEFT, space_before=8)
-
-            # Underline accent
-            _solid_rect(slide, Inches(1.1), Inches(4.75), Inches(3.0), Inches(0.07), c["accent"])
+                _para(tf, course_lvl, 20, False, c["accent"], PP_ALIGN.LEFT, space_before=8)
+            _rect(slide, Inches(1.1), Inches(4.75), Inches(3.0), Inches(0.07), c["accent"])
+            if notes:
+                slide.notes_slide.notes_text_frame.text = notes
             continue
 
         # ── Slide number badge ────────────────────────────────────
-        badge_w = Inches(0.55)
-        badge_h = Inches(0.32)
-        _solid_rect(slide, _W - badge_w - Inches(0.12), _H - badge_h - Inches(0.1), badge_w, badge_h, c["badge_bg"])
-        btf = _textbox(slide, _W - badge_w - Inches(0.10), _H - badge_h - Inches(0.08), badge_w, badge_h)
+        bw, bh = Inches(0.55), Inches(0.30)
+        _rect(slide, _W - bw - Inches(0.12), _H - bh - Inches(0.10), bw, bh, c["badge_bg"])
+        btf = _tb(slide, _W - bw - Inches(0.10), _H - bh - Inches(0.08), bw, bh)
         _para(btf, str(idx + 1), 10, True, c["badge_txt"], PP_ALIGN.CENTER)
 
         # ── Title ─────────────────────────────────────────────────
-        ttf = _textbox(slide, Inches(0.22), Inches(0.10), Inches(12.8), Inches(0.80))
+        ttf = _tb(slide, Inches(0.22), Inches(0.10), Inches(12.8), Inches(0.80))
         _para(ttf, title, 26, True, c["title_txt"])
-
-        # ── Title underline ───────────────────────────────────────
-        _solid_rect(slide, Inches(0.22), Inches(0.93), Inches(12.8), Inches(0.035), c["accent"])
+        _rect(slide, Inches(0.22), Inches(0.93), Inches(12.8), Inches(0.035), c["accent"])
 
         # ══════════════════════════════════════════════════════════
-        # REFERENCE / RESOURCE SLIDE
+        # REFERENCE SLIDE
         # ══════════════════════════════════════════════════════════
         if is_ref:
-            points = sd.get("points", [])
-            content_tf = _textbox(slide, Inches(0.35), Inches(1.05), Inches(12.6), Inches(5.8))
-            for pt in points:
-                headline = str(pt.get("headline", "")).strip()
-                detail   = str(pt.get("detail",   "")).strip()
-                # Detect URL in detail field
-                is_url = detail.startswith("http")
-                _para(content_tf, f"  {headline}", 16, True,  c["headline"],   space_before=14)
-                if detail:
-                    _para(content_tf, f"  {detail}", 13, False, c["accent"] if is_url else c["detail_txt"], space_before=2)
-
-            # Example as note at bottom
-            example = str(sd.get("example", "")).strip()
-            if example:
-                _solid_rect(slide, Inches(0.22), Inches(6.6), Inches(12.8), Inches(0.72), c["ex_bg"])
-                etf = _textbox(slide, Inches(0.40), Inches(6.65), Inches(12.5), Inches(0.62))
-                _para(etf, example, 11, False, c["ex_txt"])
+            ctf = _tb(slide, Inches(0.35), Inches(1.05), Inches(12.6), Inches(5.8))
+            for pt in raw_points:
+                hl, det = _extract_point(pt)   # ← safe for str or dict
+                _para(ctf, f"  {hl}", 16, True, c["headline"], space_before=14)
+                if det:
+                    col = c["ref_txt"] if det.startswith("http") else c["detail"]
+                    _para(ctf, f"  {det}", 13, False, col, space_before=2)
+            if notes:
+                slide.notes_slide.notes_text_frame.text = notes
             continue
 
         # ══════════════════════════════════════════════════════════
-        # CONTENT SLIDE — main layout
+        # CONTENT SLIDE
         # ══════════════════════════════════════════════════════════
-        points  = sd.get("points", [])
-        example = str(sd.get("example", "")).strip()
-        img_sug = sd.get("image_suggestion")
-        notes   = str(sd.get("speaker_notes", "")).strip()
 
-        # Decide vertical space allocation
-        has_example = bool(example)
-        ex_h        = Inches(1.10)
-        ex_top      = _H - ex_h - Inches(0.12)
+        # Decide whether to embed an image
+        has_img   = False
+        img_bytes: bytes | None = None
+
+        # AI-suggested image via Unsplash
+        if img_query:
+            if img_query not in _img_cache:
+                _img_cache[img_query] = _fetch_unsplash(img_query)
+            img_bytes = _img_cache[img_query]
+            has_img   = img_bytes is not None
+
+        # Professor-uploaded image (base64) — overrides AI image
+        if prof_img_d and prof_img_d.get("data"):
+            try:
+                img_bytes = base64.b64decode(str(prof_img_d["data"]))
+                has_img   = True
+            except Exception:
+                has_img = False
+
+        # Space allocation
+        has_example  = bool(example)
+        has_proftext = bool(prof_text)
+        bottom_h     = Inches(0.12)
+        if has_example:   bottom_h += Inches(1.10)
+        if has_proftext:  bottom_h += Inches(0.90)
+
+        ex_top      = _H - bottom_h
         content_top = Inches(1.05)
-        content_h   = (ex_top - content_top - Inches(0.12)) if has_example else (_H - content_top - Inches(0.15))
+        content_h   = ex_top - content_top - Inches(0.10)
 
-        # ── Points section ────────────────────────────────────────
-        # We render each point as: bullet dot | HEADLINE (bold) then detail below indented
-        point_tf = _textbox(slide, Inches(0.22), content_top, Inches(12.8), content_h)
+        txt_w = Inches(7.8) if has_img else Inches(12.8)
 
-        for i, pt in enumerate(points):
-            headline = str(pt.get("headline", "")).strip()
-            detail   = str(pt.get("detail",   "")).strip()
+        # Embed image
+        if has_img and img_bytes:
+            try:
+                slide.shapes.add_picture(
+                    io.BytesIO(img_bytes),
+                    Inches(8.1), Inches(1.05), Inches(4.9), Inches(4.80)
+                )
+            except Exception:
+                has_img = False
+                txt_w   = Inches(12.8)
 
-            space_top = 10 if i == 0 else 18   # more breathing room between points
+        # ── Points ────────────────────────────────────────────────
+        ptf = _tb(slide, Inches(0.22), content_top, txt_w, content_h)
 
-            # ── Headline row: accent dot + bold headline ──────────
-            # We render "●  HEADLINE" as one paragraph with two runs
-            if point_tf.paragraphs and point_tf.paragraphs[0].text == "":
-                h_para = point_tf.paragraphs[0]
+        for i, pt in enumerate(raw_points):
+            hl, det = _extract_point(pt)   # ← safe for str or dict
+            if not hl:
+                continue
+
+            space_top = 10 if i == 0 else 16
+
+            if ptf.paragraphs and ptf.paragraphs[0].text == "":
+                hp = ptf.paragraphs[0]
             else:
-                h_para = point_tf.add_paragraph()
+                hp = ptf.add_paragraph()
+            hp.space_before = Pt(space_top)
+            hp.space_after  = Pt(2)
 
-            # Dot run (accent colour)
-            dot_run            = h_para.add_run()
-            dot_run.text       = "●  "
-            dot_run.font.size  = Pt(13)
-            dot_run.font.bold  = True
-            dot_run.font.color.rgb = _rgb(c["dot"])
+            dot_r = hp.add_run()
+            dot_r.text = "●  "
+            dot_r.font.size  = Pt(12)
+            dot_r.font.bold  = True
+            dot_r.font.color.rgb = _rgb(c["dot"])
 
-            # Headline run
-            hl_run             = h_para.add_run()
-            hl_run.text        = headline
-            hl_run.font.size   = Pt(18)
-            hl_run.font.bold   = True
-            hl_run.font.color.rgb = _rgb(c["headline"])
-            h_para.space_before = Pt(space_top)
-            h_para.space_after  = Pt(2)
+            hl_r = hp.add_run()
+            hl_r.text = hl
+            hl_r.font.size  = Pt(17)
+            hl_r.font.bold  = True
+            hl_r.font.color.rgb = _rgb(c["headline"])
 
-            # ── Detail paragraph (indented, smaller, normal weight) ─
-            if detail:
-                d_para = point_tf.add_paragraph()
-                d_run            = d_para.add_run()
-                d_run.text       = "     " + detail   # indent with spaces
-                d_run.font.size  = Pt(13)
-                d_run.font.bold  = False
-                d_run.font.color.rgb = _rgb(c["detail_txt"])
-                d_para.space_before = Pt(1)
-                d_para.space_after  = Pt(2)
-                d_para.alignment    = PP_ALIGN.LEFT
-
-        # ── Thin separator before example ─────────────────────────
-        if has_example:
-            _solid_rect(slide, Inches(0.22), ex_top - Inches(0.08), Inches(12.8), Inches(0.025), c["divider"])
+            if det:
+                dp = ptf.add_paragraph()
+                dp.space_before = Pt(2)
+                dp.space_after  = Pt(2)
+                dr = dp.add_run()
+                dr.text = "     " + det
+                dr.font.size  = Pt(12)
+                dr.font.bold  = False
+                dr.font.color.rgb = _rgb(c["detail"])
 
         # ── Example box ───────────────────────────────────────────
+        cur_y = ex_top
         if has_example:
-            _solid_rect(slide, Inches(0.22), ex_top, Inches(12.8), ex_h, c["ex_bg"])
+            _rect(slide, Inches(0.22), cur_y - Inches(0.07),
+                  Inches(12.8), Inches(0.025), c["divider"])
+            ex_h = Inches(1.05)
+            _rect(slide, Inches(0.22), cur_y, Inches(12.8), ex_h, c["ex_bg"])
 
-            ex_tf = _textbox(slide, Inches(0.40), ex_top + Inches(0.07), Inches(12.5), ex_h - Inches(0.1))
+            etf = _tb(slide, Inches(0.40), cur_y + Inches(0.07),
+                      Inches(12.4), ex_h - Inches(0.10))
+            if etf.paragraphs and etf.paragraphs[0].text == "":
+                ep = etf.paragraphs[0]
+            else:
+                ep = etf.add_paragraph()
 
-            # "EXAMPLE" label run
-            label_para       = ex_tf.paragraphs[0]
-            label_run        = label_para.add_run()
-            label_run.text   = "EXAMPLE   "
-            label_run.font.size  = Pt(10)
-            label_run.font.bold  = True
-            label_run.font.color.rgb = _rgb(c["ex_label"])
+            lb = ep.add_run(); lb.text = "EXAMPLE   "
+            lb.font.size = Pt(10); lb.font.bold = True
+            lb.font.color.rgb = _rgb(c["ex_label"])
 
-            # Example text run (same paragraph — label + text on one line for compactness)
-            text_run         = label_para.add_run()
-            text_run.text    = example
-            text_run.font.size = Pt(12)
-            text_run.font.bold = False
-            text_run.font.color.rgb = _rgb(c["ex_txt"])
+            tx = ep.add_run(); tx.text = example
+            tx.font.size = Pt(12); tx.font.bold = False
+            tx.font.color.rgb = _rgb(c["ex_txt"])
 
-        # ── Image suggestion (subtle footer tag) ──────────────────
-        if img_sug and str(img_sug).lower() not in ("null", "none", ""):
-            img_tf = _textbox(slide, Inches(0.22), _H - Inches(0.28), Inches(8.0), Inches(0.25))
-            _para(img_tf, f"🖼  {img_sug}", 8, False, c["accent"], italic=True)
+            cur_y += ex_h
+
+        # ── Professor note box ────────────────────────────────────
+        if has_proftext:
+            note_h = Inches(0.85)
+            _rect(slide, Inches(0.22), cur_y + Inches(0.04),
+                  Inches(12.8), note_h, c["note_bg"])
+
+            ntf = _tb(slide, Inches(0.40), cur_y + Inches(0.10),
+                      Inches(12.4), note_h - Inches(0.10))
+            if ntf.paragraphs and ntf.paragraphs[0].text == "":
+                np_ = ntf.paragraphs[0]
+            else:
+                np_ = ntf.add_paragraph()
+
+            lb2 = np_.add_run(); lb2.text = "PROFESSOR NOTE   "
+            lb2.font.size = Pt(9); lb2.font.bold = True
+            lb2.font.color.rgb = _rgb(c["note_txt"])
+
+            tx2 = np_.add_run(); tx2.text = prof_text
+            tx2.font.size = Pt(11); tx2.font.bold = False
+            tx2.font.color.rgb = _rgb(c["note_txt"])
 
         # ── Speaker notes ─────────────────────────────────────────
         if notes:
             slide.notes_slide.notes_text_frame.text = notes
 
-    stream = io.BytesIO()
-    prs.save(stream)
-    stream.seek(0)
-    return stream
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return buf
