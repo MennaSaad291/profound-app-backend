@@ -98,7 +98,7 @@ def _parse_json_safe(text: str) -> dict:
 
 def _gen_batch(start: int, end: int, role: str, total: int,
                topic: str, prof_note: str,
-               sources: list, depth: str) -> list:
+               depth: str) -> list:
     count = end - start + 1
 
     if role == "intro":
@@ -276,17 +276,13 @@ def generate_lecture_json(data) -> dict:
 
     topic      = data.topic
     additional = getattr(data, "additional_instructions", "") or ""
-    custom_src = getattr(data, "custom_sources", "") or ""
-
-    src = [s.strip() for s in custom_src.split(",") if s.strip()] if custom_src else []
-
     prof_note = additional or "Produce a thorough, student-friendly academic lecture."
     depth     = _depth_instruction(requested)
 
     # ── Chunked generation ────────────────────────────────────────
     all_slides = []
     for (start, end, role) in _make_batches(requested):
-        batch = _gen_batch(start, end, role, requested, topic, prof_note, src, depth)
+        batch = _gen_batch(start, end, role, requested, topic, prof_note, depth)
         all_slides.extend(batch)
 
     # ── Trim or pad to exact requested count ──────────────────────
@@ -299,27 +295,6 @@ def generate_lecture_json(data) -> dict:
             "image_suggestion": None,
             "speaker_notes":    "",
         })
-
-    # ── Inject professor manual text additions ────────────────────
-    for item in (getattr(data, "manual_texts", []) or []):
-        try:
-            idx  = int(getattr(item, "slide", 1)) - 1
-            text = str(getattr(item, "text", "")).strip()
-            if 0 <= idx < len(all_slides) and text:
-                all_slides[idx]["professor_text"] = text
-        except Exception:
-            pass
-
-    # ── Inject professor manual image additions ───────────────────
-    for item in (getattr(data, "manual_images", []) or []):
-        try:
-            idx   = int(getattr(item, "slide",    1)) - 1
-            fname = str(getattr(item, "filename", ""))
-            b64   = str(getattr(item, "data",     ""))
-            if 0 <= idx < len(all_slides) and b64:
-                all_slides[idx]["professor_image"] = {"filename": fname, "data": b64}
-        except Exception:
-            pass
 
 
     if not all_slides:

@@ -13,6 +13,7 @@ import json
 import base64
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
@@ -176,7 +177,7 @@ def _fetch_image(query: str) -> bytes | None:
             "&srnamespace=6&srlimit=1&format=json"
         )
         req = urllib.request.Request(search_url, headers={"User-Agent": "LectureGen/1.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read().decode())
             results = data.get("query", {}).get("search", [])
             if results:
@@ -188,7 +189,7 @@ def _fetch_image(query: str) -> bytes | None:
                     "&prop=imageinfo&iiprop=url&format=json"
                 )
                 req2 = urllib.request.Request(img_url, headers={"User-Agent": "LectureGen/1.0"})
-                with urllib.request.urlopen(req2, timeout=6) as resp2:
+                with urllib.request.urlopen(req2, timeout=3) as resp2:
                     idata = json.loads(resp2.read().decode())
                     pages = idata.get("query", {}).get("pages", {})
                     for page in pages.values():
@@ -196,7 +197,7 @@ def _fetch_image(query: str) -> bytes | None:
                         if img_info:
                             direct_url = img_info[0]["url"]
                             req3 = urllib.request.Request(direct_url, headers={"User-Agent": "LectureGen/1.0"})
-                            with urllib.request.urlopen(req3, timeout=8) as resp3:
+                            with urllib.request.urlopen(req3, timeout=4) as resp3:
                                 if resp3.status == 200:
                                     img_bytes = resp3.read()
                                     # Only accept raster images (not SVG — pptx-python can't render SVG)
@@ -211,7 +212,7 @@ def _fetch_image(query: str) -> bytes | None:
         seed = abs(hash(query)) % 1000
         url  = f"https://picsum.photos/seed/{seed}/800/450"
         req  = urllib.request.Request(url, headers={"User-Agent": "LectureGen/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=4) as resp:
             if resp.status == 200:
                 return resp.read()
     except Exception:
@@ -232,7 +233,23 @@ def create_pptx(data: dict) -> io.BytesIO:
     prs.slide_width  = _W
     prs.slide_height = _H
 
+    # ── Pre-fetch all images in parallel (max 20s total) ────────
     _img_cache: dict[str, bytes | None] = {}
+    _queries = list({
+        str(sd.get("image_query", sd.get("image_suggestion", "")) or "").strip()
+        for sd in slides_data
+        if isinstance(sd, dict)
+    } - {"", "null", "none"})
+
+    if _queries:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            future_map = {pool.submit(_fetch_image, q): q for q in _queries}
+            for future in as_completed(future_map, timeout=20):
+                q = future_map[future]
+                try:
+                    _img_cache[q] = future.result(timeout=1)
+                except Exception:
+                    _img_cache[q] = None
 
     for idx, sd in enumerate(slides_data):
         # ── Defensive: sd must be a dict ─────────────────────────
