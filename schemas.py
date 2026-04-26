@@ -60,7 +60,6 @@ class LectureRequest(BaseModel):
     topic: str
     pages_count: int = Field(default=10, ge=3, le=70)
     additional_instructions: str = ""
-    include_media: bool = False
     theme: str = "Modern Minimalist"
 
 

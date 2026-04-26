@@ -5,15 +5,11 @@ Professional university lecture PowerPoint export.
 Fixes:
 - 'str' object has no attribute 'get' — defensive handling for string and dict points
 - Pure solid colour themes — no external image files required
-- Professor images embedded from base64
+- Pure solid colour themes — no external image files required
 - Professor manual text shown as highlighted note box
 """
 import io
 import json
-import base64
-import urllib.request
-import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
@@ -156,71 +152,6 @@ def _extract_point(pt) -> tuple[str, str]:
     return str(pt).strip(), ""
 
 
-def _fetch_image(query: str) -> bytes | None:
-    """
-    Fetch a relevant image for a slide.
-    Strategy:
-      1. Try Wikimedia Commons API (topic-relevant diagrams/photos, CC licensed)
-      2. Fall back to Lorem Picsum (abstract placeholder, always works)
-    Returns bytes or None on failure.
-    """
-    if not query:
-        return None
-
-    # ── 1. Wikimedia Commons search ───────────────────────────────
-    try:
-        clean = query.strip()
-        # Search Commons for the query
-        search_url = (
-            "https://en.wikipedia.org/w/api.php"
-            f"?action=query&list=search&srsearch={urllib.request.quote(clean)}"
-            "&srnamespace=6&srlimit=1&format=json"
-        )
-        req = urllib.request.Request(search_url, headers={"User-Agent": "LectureGen/1.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode())
-            results = data.get("query", {}).get("search", [])
-            if results:
-                title = results[0]["title"]  # e.g. "File:TCP_handshake.svg"
-                # Get image URL from Commons
-                img_url = (
-                    "https://en.wikipedia.org/w/api.php"
-                    f"?action=query&titles={urllib.request.quote(title)}"
-                    "&prop=imageinfo&iiprop=url&format=json"
-                )
-                req2 = urllib.request.Request(img_url, headers={"User-Agent": "LectureGen/1.0"})
-                with urllib.request.urlopen(req2, timeout=3) as resp2:
-                    idata = json.loads(resp2.read().decode())
-                    pages = idata.get("query", {}).get("pages", {})
-                    for page in pages.values():
-                        img_info = page.get("imageinfo", [])
-                        if img_info:
-                            direct_url = img_info[0]["url"]
-                            req3 = urllib.request.Request(direct_url, headers={"User-Agent": "LectureGen/1.0"})
-                            with urllib.request.urlopen(req3, timeout=4) as resp3:
-                                if resp3.status == 200:
-                                    img_bytes = resp3.read()
-                                    # Only accept raster images (not SVG — pptx-python can't render SVG)
-                                    if img_bytes[:4] in (b'\x89PNG', b'\xff\xd8\xff', b'GIF8') or img_bytes[:2] == b'BM':
-                                        return img_bytes
-    except Exception:
-        pass
-
-    # ── 2. Picsum fallback (abstract photo, always works) ─────────
-    try:
-        # Use query hash for consistent image per topic
-        seed = abs(hash(query)) % 1000
-        url  = f"https://picsum.photos/seed/{seed}/800/450"
-        req  = urllib.request.Request(url, headers={"User-Agent": "LectureGen/1.0"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            if resp.status == 200:
-                return resp.read()
-    except Exception:
-        pass
-
-    return None
-
-
 def create_pptx(data: dict) -> io.BytesIO:
     theme_name  = data.get("theme", "Modern Minimalist")
     c           = THEMES.get(theme_name, THEMES["Modern Minimalist"])
@@ -232,24 +163,6 @@ def create_pptx(data: dict) -> io.BytesIO:
     prs = Presentation()
     prs.slide_width  = _W
     prs.slide_height = _H
-
-    # ── Pre-fetch all images in parallel (max 20s total) ────────
-    _img_cache: dict[str, bytes | None] = {}
-    _queries = list({
-        str(sd.get("image_query", sd.get("image_suggestion", "")) or "").strip()
-        for sd in slides_data
-        if isinstance(sd, dict)
-    } - {"", "null", "none"})
-
-    if _queries:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            future_map = {pool.submit(_fetch_image, q): q for q in _queries}
-            for future in as_completed(future_map, timeout=20):
-                q = future_map[future]
-                try:
-                    _img_cache[q] = future.result(timeout=1)
-                except Exception:
-                    _img_cache[q] = None
 
     for idx, sd in enumerate(slides_data):
         # ── Defensive: sd must be a dict ─────────────────────────
@@ -268,13 +181,7 @@ def create_pptx(data: dict) -> io.BytesIO:
         example     = str(sd.get("example",       "") or "").strip()
         notes       = str(sd.get("speaker_notes", "") or "").strip()
         prof_text   = str(sd.get("professor_text","") or "").strip()
-        prof_img_d  = sd.get("professor_image")
-        if not isinstance(prof_img_d, dict):
-            prof_img_d = None
 
-        img_query = str(sd.get("image_query", sd.get("image_suggestion", "") or "") or "").strip()
-        if img_query.lower() in ("null", "none", ""):
-            img_query = ""
 
         # ── Slide background ──────────────────────────────────────
         _rect(slide, 0, 0, _W, _H, c["bg"])
@@ -309,24 +216,6 @@ def create_pptx(data: dict) -> io.BytesIO:
         # CONTENT SLIDE
         # ══════════════════════════════════════════════════════════
 
-        # Decide whether to embed an image
-        has_img   = False
-        img_bytes: bytes | None = None
-
-        # AI-suggested image via Wikimedia / Picsum
-        if img_query:
-            if img_query not in _img_cache:
-                _img_cache[img_query] = _fetch_image(img_query)
-            img_bytes = _img_cache[img_query]
-            has_img   = img_bytes is not None
-
-        # Professor-uploaded image (base64) — overrides AI image
-        if prof_img_d and prof_img_d.get("data"):
-            try:
-                img_bytes = base64.b64decode(str(prof_img_d["data"]))
-                has_img   = True
-            except Exception:
-                has_img = False
 
         # Space allocation
         has_example  = bool(example)
@@ -339,18 +228,8 @@ def create_pptx(data: dict) -> io.BytesIO:
         content_top = Inches(1.05)
         content_h   = ex_top - content_top - Inches(0.10)
 
-        txt_w = Inches(7.8) if has_img else Inches(12.8)
+        txt_w = Inches(12.8)
 
-        # Embed image
-        if has_img and img_bytes:
-            try:
-                slide.shapes.add_picture(
-                    io.BytesIO(img_bytes),
-                    Inches(8.1), Inches(1.05), Inches(4.9), Inches(4.80)
-                )
-            except Exception:
-                has_img = False
-                txt_w   = Inches(12.8)
 
         # ── Points ────────────────────────────────────────────────
         ptf = _tb(slide, Inches(0.22), content_top, txt_w, content_h)
