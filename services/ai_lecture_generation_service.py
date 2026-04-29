@@ -9,6 +9,7 @@ AI Lecture Generation Service
 import os
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from groq import Groq
 from fastapi import HTTPException
 
@@ -44,12 +45,12 @@ def _make_batches(total: int) -> list:
     # Intro batch (slides 1-3)
     batches.append((1, intro_end, "intro"))
 
-    # Core batches — max 5 per batch to stay well within token limits
+    # Core batches — max 3 per batch to stay well within token limits
     core_s = intro_end + 1
     core_e = summary_start - 1
     i = core_s
     while i <= core_e:
-        end = min(i + 4, core_e)   # 5 slides per batch
+        end = min(i + 2, core_e)   # 3 slides per batch — prevents JSON truncation
         batches.append((i, end, "core"))
         i = end + 1
 
@@ -98,7 +99,7 @@ def _parse_json_safe(text: str) -> dict:
 
 def _gen_batch(start: int, end: int, role: str, total: int,
                topic: str, prof_note: str,
-               sources: list, depth: str) -> list:
+               depth: str) -> list:
     count = end - start + 1
 
     if role == "intro":
@@ -184,7 +185,7 @@ STRICT RULES:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
-            max_tokens=6000,   # Increased from 4000
+            max_tokens=4000,   # 3 slides per batch — 4000 is plenty
         )
 
         raw = c.choices[0].message.content.strip()
@@ -276,18 +277,37 @@ def generate_lecture_json(data) -> dict:
 
     topic      = data.topic
     additional = getattr(data, "additional_instructions", "") or ""
-    custom_src = getattr(data, "custom_sources", "") or ""
-
-    src = [s.strip() for s in custom_src.split(",") if s.strip()] if custom_src else []
-
     prof_note = additional or "Produce a thorough, student-friendly academic lecture."
     depth     = _depth_instruction(requested)
 
-    # ── Chunked generation ────────────────────────────────────────
+    # ── Chunked generation (parallel batches) ───────────────────
+    batches = _make_batches(requested)
+    results: dict[int, list] = {}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        future_map = {
+            pool.submit(_gen_batch, start, end, role, requested, topic, prof_note, depth): idx
+            for idx, (start, end, role) in enumerate(batches)
+        }
+        for future in as_completed(future_map):
+            idx = future_map[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                start, end, _ = batches[idx]
+                count = end - start + 1
+                results[idx] = [
+                    {
+                        "title": f"Slide {start + i}: {topic}",
+                        "points": [{"headline": "Content unavailable", "detail": "Please regenerate this slide."}],
+                        "example": "", "image_suggestion": None, "speaker_notes": "",
+                    }
+                    for i in range(count)
+                ]
+
     all_slides = []
-    for (start, end, role) in _make_batches(requested):
-        batch = _gen_batch(start, end, role, requested, topic, prof_note, src, depth)
-        all_slides.extend(batch)
+    for idx in sorted(results):
+        all_slides.extend(results[idx])
 
     # ── Trim or pad to exact requested count ──────────────────────
     all_slides = all_slides[:requested]
@@ -299,27 +319,6 @@ def generate_lecture_json(data) -> dict:
             "image_suggestion": None,
             "speaker_notes":    "",
         })
-
-    # ── Inject professor manual text additions ────────────────────
-    for item in (getattr(data, "manual_texts", []) or []):
-        try:
-            idx  = int(getattr(item, "slide", 1)) - 1
-            text = str(getattr(item, "text", "")).strip()
-            if 0 <= idx < len(all_slides) and text:
-                all_slides[idx]["professor_text"] = text
-        except Exception:
-            pass
-
-    # ── Inject professor manual image additions ───────────────────
-    for item in (getattr(data, "manual_images", []) or []):
-        try:
-            idx   = int(getattr(item, "slide",    1)) - 1
-            fname = str(getattr(item, "filename", ""))
-            b64   = str(getattr(item, "data",     ""))
-            if 0 <= idx < len(all_slides) and b64:
-                all_slides[idx]["professor_image"] = {"filename": fname, "data": b64}
-        except Exception:
-            pass
 
 
     if not all_slides:
