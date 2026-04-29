@@ -95,3 +95,32 @@ class Question(BaseModel):
 class ExamResponse(BaseModel):
     exam_id: str
     questions: List[Question]
+
+
+class AssignmentCreate(BaseModel):
+    assignment_name: str
+    course_id: int
+    is_model_answer: bool
+    assignment_question: Optional[str] = None
+    assignment_file_path:  Optional[str] = None
+
+    model_answer: Optional[str] = None
+    rubric: Optional[str] = None
+
+
+class CourseCreate(BaseModel):
+    user_id: int
+    code: str
+    name: str
+    semester: str
+    department: Optional[str] = None
+
+
+
+class GradeUpdate(BaseModel):
+    ai_grade: int
+    status: str
+class FinalizeRequest(BaseModel):
+    manual_grade: int
+
+

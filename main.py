@@ -4,7 +4,6 @@ import io
 import json
 import re
 import uuid
-import datetime
 import pandas as pd
 from typing import List, Optional
 from dotenv import load_dotenv
@@ -14,13 +13,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+
+from fastapi import Form
+import os
+from fastapi import Form, File, UploadFile, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import Optional
+import database
 from database import engine, Base, get_db
 from models import (UserDB, CourseDB, StudentDB, PublicationDB,
                     ProjectDB, InterestDB, ExamDB, QuestionDB, SubmissionDB, PerformanceDB, ErrorAnalysisDB,
                     AssignmentDB, GradeUpdate, FinalizeRequest)
 from schemas import (UserCreate, UserLogin, UserUpdate,
                     LectureRequest, CourseResponse, ExamRequest,
-                    ExamResponse, Question,
+                    ExamResponse, Question,AssignmentCreate,CourseCreate,
                     ChangePasswordRequest, VerifyPasswordRequest)
 from routes import analysis
 from groq import Groq
@@ -30,6 +36,8 @@ from fastapi import FastAPI, UploadFile, File
 import shutil
 from file_utils import extract_text
 from datetime import datetime
+
+from services import grading_service
 from services.grading_service import perform_nlp_grading
 
 
@@ -38,10 +46,12 @@ try:
 except ImportError:
     create_pptx = None
 
-try:
-    from services.ai_lecture_generation_service import generate_lecture_json
-except ImportError:
-    from ai_lecture_generation_service import generate_lecture_json
+# try:
+#     from services.ai_lecture_generation_service import generate_lecture_json
+# except ImportError:
+#     from ai_lecture_generation_service import generate_lecture_json
+
+
 
 load_dotenv()
 Base.metadata.create_all(bind=engine)
@@ -235,13 +245,13 @@ async def export_exam_word(exam_id: str, db: Session = Depends(get_db)):
     )
 
 # --- Lecture Generation ---
-@app.post("/api/generate-lecture")
-async def generate_lecture(data: LectureRequest):
-    """
-    Generate lecture slides using the AI service.
-    Always returns {"slides": [...]} with validated structure.
-    """
-    return generate_lecture_json(data)
+# @app.post("/api/generate-lecture")
+# async def generate_lecture(data: LectureRequest):
+#     """
+#     Generate lecture slides using the AI service.
+#     Always returns {"slides": [...]} with validated structure.
+#     """
+#     return generate_lecture_json(data)
 
 
 def _build_pptx_response(data: dict):
@@ -482,12 +492,22 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+from fastapi.middleware.cors import CORSMiddleware
+
+# 1. ADD THIS to allow Flutter to connect
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 2. UPDATE THIS to show the last submission first
 @app.get("/submissions")
-async def get_all_submissions(db: Session = Depends(get_db)):
-    submissions = db.query(SubmissionDB).order_by(SubmissionDB.id.desc()).all()
-    return submissions
-
-
+async def get_submissions(assignment_id: int, db: Session = Depends(get_db)):
+    return db.query(SubmissionDB).filter(
+        SubmissionDB.assignment_id == assignment_id
+    ).order_by(SubmissionDB.id.desc()).all()
 @app.put("/api/submissions/{submission_id}")
 def update_submission_grade(submission_id: int, data: GradeUpdate, db: Session = Depends(get_db)):
     submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
@@ -500,55 +520,6 @@ def update_submission_grade(submission_id: int, data: GradeUpdate, db: Session =
     return {"message": "Grade updated successfully"}
 
 # --------grading----------
-@app.post("/grade-submission/{assignment_id}")
-async def grade_submission(assignment_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    filename_only = os.path.splitext(file.filename)[0]
-    temp_path = f"temp_{file.filename}"
-
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    try:
-        text_content = extract_text(temp_path)
-        assignment = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
-        rubric = assignment.assignment_name if assignment else "General Academic Rubric"
-
-        nlp_results = perform_nlp_grading(text_content, rubric)
-
-        new_submission = SubmissionDB(
-            student_name=filename_only,
-            submission_time=datetime.now().strftime("%Y-%m-%d %I:%M %p"),
-            status="ready",
-            ai_grade=nlp_results.get("score_out_of_100"),
-            plagiarism_score=15,
-            essay_content=text_content,
-            grade_report=nlp_results
-        )
-
-        db.add(new_submission)
-        db.commit()
-        db.refresh(new_submission)
-        return {"status": "success", "id": new_submission.id}
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-
-@app.post("/assignments/{assignment_id}/run-grading")
-async def run_grading(assignment_id: int, db: Session = Depends(get_db)):
-    submissions = db.query(SubmissionDB).filter(
-        SubmissionDB.status == "pending"
-    ).all()
-
-    for sub in submissions:
-        report = perform_nlp_grading(sub.essay_content, "Standard Essay Rubric")
-        sub.ai_grade = report.get("score_out_of_100")
-        sub.grade_report = report
-        sub.status = "ready"
-
-    db.commit()
-    return {"message": f"Processed {len(submissions)} submissions"}
 
 
 @app.post("/submissions/{submission_id}/finalize")
@@ -574,3 +545,268 @@ async def finalize_submission(
         "final_grade": submission.ai_grade
     }
 
+
+
+# Ensure the upload directory exists
+UPLOAD_DIR = "uploads/assignments"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# --- Assignment Management ---
+
+@app.post("/assignments")
+async def create_assignment(
+    assignment_name: str = Form(...),
+    course_id: int = Form(...),
+    assignment_question: Optional[str] = Form(None),
+    assignment_file: Optional[UploadFile] = File(None),
+    is_model_answer: bool = Form(...),
+    model_answer: Optional[str] = Form(None),
+    rubric: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
+):
+    file_local_path = None
+
+    if assignment_file:
+        try:
+            # Use a safe filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_name = f"{course_id}_{timestamp}_{assignment_file.filename}".replace(" ", "_")
+            file_local_path = os.path.join(UPLOAD_DIR, safe_name)
+
+            with open(file_local_path, "wb") as buffer:
+                shutil.copyfileobj(assignment_file.file, buffer)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"File save error: {str(e)}")
+
+    course = db.query(CourseDB).filter(CourseDB.id == course_id).first()
+    if not course:
+        raise HTTPException(status_code=400, detail="Course not found")
+
+    new_assignment = AssignmentDB(
+        assignment_name=assignment_name,
+        course_id=course_id,
+        assignment_question=assignment_question,
+        assignment_file_path=file_local_path,
+        model_answer=model_answer,
+        rubric=rubric,
+        is_model_answer=is_model_answer
+    )
+
+    db.add(new_assignment)
+    db.commit()
+    db.refresh(new_assignment)
+    return {"message": "Success", "id": new_assignment.id}
+
+@app.get("/assignments-with-submissions/{course_id}")
+async def get_nested_assignments(course_id: int, db: Session = Depends(get_db)):
+    # Optimization: Use joinedload if your relationships are set up in models.py
+    assignments = db.query(AssignmentDB).filter(AssignmentDB.course_id == course_id).all()
+    result = []
+    for assign in assignments:
+        subs = db.query(SubmissionDB).filter(SubmissionDB.assignment_id == assign.id).all()
+        result.append({
+            "id": assign.id,
+            "assignment_name": assign.assignment_name,
+            "model_answer": assign.model_answer,
+            "rubric": assign.rubric,
+            "is_model_answer": assign.is_model_answer,
+            "submissions": [
+                {
+                    "id": s.id,
+                    "student_name": s.student_name,
+                    "ai_grade": s.ai_grade,
+                    "status": s.status,
+                    "grade_report": s.grade_report
+                } for s in subs
+            ]
+        })
+    return result
+
+
+
+@app.post("/grade-submission/{assignment_id}")
+async def grade_student(
+    assignment_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    assign = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
+
+    if not assign:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+
+    # ------------------------
+    # Save + extract student file
+    # ------------------------
+    content = await file.read()
+
+    ext = file.filename.lower().split(".")[-1]
+    temp_path = f"temp_{uuid.uuid4()}.{ext}"
+
+    with open(temp_path, "wb") as f:
+        f.write(content)
+
+    student_text = ""
+
+    # ✅ DOCX handling
+    if ext == "docx":
+        from docx import Document
+        doc = Document(temp_path)
+        student_text = "\n".join([p.text for p in doc.paragraphs])
+
+    # ✅ PDF handling
+    elif ext == "pdf":
+        student_text = extract_text(temp_path)
+
+    else:
+        os.remove(temp_path)
+        raise HTTPException(status_code=400, detail="Only PDF or DOCX files are allowed")
+
+    os.remove(temp_path)
+
+    # ------------------------
+    # DEBUG INPUTS
+    # ------------------------
+    print("\n========== DEBUG START ==========")
+    print("Student Answer:\n", student_text[:500])
+    print("Assignment Question:\n", assign.assignment_question)
+    print("Model Answer:\n", assign.model_answer if assign.is_model_answer else "None")
+    print("Rubric:\n", assign.rubric if not assign.is_model_answer else "None")
+
+    # ------------------------
+    # BUILD REFERENCE BASED ON MODE
+    # ------------------------
+    if assign.is_model_answer:
+        mode = "MODEL"
+        reference = f"""
+### MODE: MODEL_ANSWER
+QUESTION:
+{assign.assignment_question}
+
+IDEAL ANSWER:
+{assign.model_answer}
+"""
+    else:
+        mode = "RUBRIC"
+        reference = f"""
+### MODE: RUBRIC
+QUESTION:
+{assign.assignment_question}
+
+RUBRIC:
+{assign.rubric}
+"""
+
+    print("MODE:", mode)
+    print("FINAL REFERENCE SENT TO AI:\n", reference)
+
+    # ------------------------
+    # CALL AI
+    # ------------------------
+    ai_report = perform_nlp_grading(
+        student_text=student_text,
+        mode=mode,
+        reference=reference
+    )
+
+    print("AI RESPONSE:\n", ai_report)
+    print("=========== DEBUG END ===========\n")
+
+    # ------------------------
+    # SAVE SUBMISSION
+    # ------------------------
+    new_sub = SubmissionDB(
+        assignment_id=assignment_id,
+        student_name=file.filename.split('.')[0],
+        status="ready",
+        ai_grade=ai_report.get('score_out_of_100', 0),
+        grade_report=ai_report,
+        essay_content=student_text
+    )
+
+    db.add(new_sub)
+    db.commit()
+
+    return {
+        "status": "success",
+        "grade": ai_report.get("score_out_of_100", 0),
+        "mode": mode,
+        "report": ai_report
+    }
+
+
+@app.put("/update-submission-grade/{submission_id}")
+async def update_grade(submission_id: int, data: dict, db: Session = Depends(get_db)):
+    submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    submission.ai_grade = data['final_grade']  # Overwriting with the manual adjustment
+    db.commit()
+    return {"message": "Success"}
+
+@app.post("/courses")
+async def create_course(course: CourseCreate, db: Session = Depends(get_db)):
+    try:
+        new_course = CourseDB(
+            user_id=course.user_id,
+            code=course.code,
+            name=course.name,
+            semester=course.semester,
+            department=course.department,
+            students=0,       # Initializing with default values
+            progress=0,
+            status="active"
+        )
+        db.add(new_course)
+        db.commit()
+        db.refresh(new_course)
+        return new_course
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# In main.py
+from services.grading_service import perform_nlp_grading
+
+@app.post("/analyze-general-submission")
+async def analyze_general(data: dict):
+    student_text = data.get("student_text")
+    mode = data.get("mode") # "MODEL" or "RUBRIC"
+    reference = data.get("reference_content")
+
+    if not all([student_text, mode, reference]):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    # Call your existing AI logic
+    try:
+        report = perform_nlp_grading(
+            student_text=student_text,
+            mode=mode,
+            reference=reference
+        )
+        return report
+    except Exception as e:
+        print(f"AI Service Error: {e}")
+        raise HTTPException(status_code=500, detail="AI grading failed")
+
+
+# Add this to your main.py if it's not already there
+@app.post("/extract-text")
+async def api_extract_text(file: UploadFile = File(...)):
+    # Create a temporary path to save the uploaded file
+    temp_path = f"temp_{file.filename}"
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        # Use your existing utility to get the text
+        text = extract_text(temp_path)
+        return {"extracted_text": text}
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)

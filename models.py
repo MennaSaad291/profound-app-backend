@@ -90,13 +90,21 @@ class QuestionDB(Base):
 class SubmissionDB(Base):
     __tablename__ = "submissions"
     id = Column(Integer, primary_key=True, index=True)
+    assignment_id = Column(Integer, ForeignKey("assignments.id", ondelete="CASCADE"))
     student_name = Column(String)
-    submission_time = Column(String)
-    # This matches your UI's 'pending' | 'ready' | 'graded' statuses
-    status = Column(String, default="pending")
+
+    # Use actual DateTime objects for better sorting
+    submission_time = Column(DateTime, default=datetime.datetime.utcnow)
+
+    # Keep these separate!
+    question_type = Column(String, default="Essay")
+    status = Column(String, default="pending")  # 'pending', 'ready', or 'graded'
+
     ai_grade = Column(Integer, nullable=True)
-    plagiarism_score = Column(Integer, nullable=True) # Used for the UI color logic
+    plagiarism_score = Column(Integer, nullable=True)
     essay_content = Column(Text, nullable=True)
+
+    # This stores the JSON report from Groq (strengths, improvements, etc.)
     grade_report = Column(JSON, nullable=True)
 
 class PerformanceDB(Base):
@@ -117,14 +125,32 @@ class ErrorAnalysisDB(Base):
     error_category = Column(String)
     error_type = Column(String)  
     
+#class AssignmentDB(Base):
+#    __tablename__ = "assignments"
+#    id = Column(Integer, primary_key=True, index=True)
+#    student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"))
+#    course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"))
+#    assignment_name = Column(String(100))
+#    rubric_text = Column(Text, nullable=True)
+#    is_submitted = Column(Boolean, default=False)
+
 class AssignmentDB(Base):
     __tablename__ = "assignments"
+
     id = Column(Integer, primary_key=True, index=True)
-    student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"))
     course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"))
+
     assignment_name = Column(String(100))
-    rubric_text = Column(Text, nullable=True)
-    is_submitted = Column(Boolean, default=False)
+
+    assignment_question = Column(Text, nullable=True)
+    assignment_file_path = Column(Text, nullable=True)
+    # MODE INPUTS (CLEAR SEPARATION)
+    model_answer = Column(Text, nullable=True)
+    rubric = Column(Text, nullable=True)
+
+    # MODE FLAG
+    is_model_answer = Column(Boolean, default=False)
+
 
 class GradeUpdate(BaseModel):
     ai_grade: int
