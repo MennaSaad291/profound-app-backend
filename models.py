@@ -124,6 +124,8 @@ class ErrorAnalysisDB(Base):
     assignment_name = Column(String)
     error_category = Column(String)
     error_type = Column(String)  
+    created_at = Column(DateTime, default=func.now())
+
     
 #class AssignmentDB(Base):
 #    __tablename__ = "assignments"

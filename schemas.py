@@ -110,5 +110,16 @@ class GradeUpdate(BaseModel):
     status: str
 class FinalizeRequest(BaseModel):
     manual_grade: int
+class ReportConfiguration(BaseModel):
+    include_pii: bool = True
+    include_benchmarks: bool = True
+    error_analysis_detail: bool = True
+    predictive_analytics: bool = True
+    attendance_data: bool = True
+    grade_distribution: bool = True
+    export_format: str = "pdf"
 
-
+class AnalysisRequest(BaseModel):
+    course_id: int | None = None
+    semester: str | None = None
+    days: int | None = None   
