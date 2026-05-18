@@ -8,7 +8,7 @@ import pandas as pd
 from typing import List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -310,27 +310,39 @@ async def grade_essay(submission_id: int, db: Session = Depends(get_db)):
         return {"status": "success", "grade": submission.ai_grade}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-# ---upload grade and attendence---
 @app.post("/upload-performance")
 async def upload_performance_sheet(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    content = await file.read()
-    if file.filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content))
-    else:
-        df = pd.read_excel(io.BytesIO(content))
+    try:
+        content = await file.read()
+
+        if file.filename.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(content))
+        else:
+            df = pd.read_excel(io.BytesIO(content))
+
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": "Invalid or corrupted file. Please upload a valid Excel or CSV file."
+            }
+        )
 
     required_columns = ["student_id", "course_id", "grade", "attendance"]
+
     if not all(col in df.columns for col in required_columns):
-        raise HTTPException(
-            status_code=400, 
-            detail="Sheet must have: student_id, course_id, grade, and attendance"
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": "Invalid file structure. Please upload a file containing: student_id, course_id, grade, and attendance."
+            }
         )
 
     records_added = 0
+
     for _, row in df.iterrows():
         current_student_id = str(row["student_id"])
         current_course_id = int(row["course_id"])
@@ -343,15 +355,64 @@ async def upload_performance_sheet(
         if student:
             new_perf = PerformanceDB(
                 student_id=student.id,
-                course_id=current_course_id, 
+                course_id=current_course_id,
                 grade=float(row["grade"]),
                 attendance=float(row["attendance"])
             )
+
             db.add(new_perf)
             records_added += 1
 
     db.commit()
-    return {"message": f"Successfully processed {records_added} records from the sheet"}    
+
+    return {
+        "message": f"Successfully processed {records_added} records from the sheet"
+    }   
+# ---upload grade and attendence---
+# @app.post("/upload-performance")
+# async def upload_performance_sheet(
+#     file: UploadFile = File(...),
+#     db: Session = Depends(get_db)
+# ):
+#     content = await file.read()
+#     if file.filename.endswith(".csv"):
+#         df = pd.read_csv(io.BytesIO(content))
+#     else:
+#         df = pd.read_excel(io.BytesIO(content))
+
+
+#     required_columns = ["student_id", "course_id", "grade", "attendance"]
+
+#     if not all(col in df.columns for col in required_columns):
+#         return JSONResponse(
+#             status_code=400,
+#             content={
+#                 "message": "Invalid file structure. Please upload a file containing: student_id, course_id, grade, and attendance."
+#             }
+#         )
+
+#     records_added = 0
+#     for _, row in df.iterrows():
+#         current_student_id = str(row["student_id"])
+#         current_course_id = int(row["course_id"])
+
+#         student = db.query(StudentDB).filter(
+#             StudentDB.student_id == current_student_id,
+#             StudentDB.course_id == current_course_id
+#         ).first()
+
+#         if student:
+#             new_perf = PerformanceDB(
+#                 student_id=student.id,
+#                 course_id=current_course_id, 
+#                 grade=float(row["grade"]),
+#                 attendance=float(row["attendance"])
+#             )
+#             db.add(new_perf)
+#             records_added += 1
+
+#     db.commit()
+#     return {"message": f"Successfully processed {records_added} records from the sheet"}    
 
 app.include_router(analysis.router)
 

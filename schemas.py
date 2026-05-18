@@ -122,4 +122,6 @@ class ReportConfiguration(BaseModel):
 class AnalysisRequest(BaseModel):
     course_id: int | None = None
     semester: str | None = None
-    days: int | None = None   
+    days: int | None = None 
+    from_date: Optional[str] = None
+    to_date: Optional[str] = None  

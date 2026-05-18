@@ -16,10 +16,20 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from models import SubmissionDB, AssignmentDB
-
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib import colors
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image,
+)
+
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.lib.enums import TA_LEFT
+
 def get_courses(db):
     courses = db.query(CourseDB).all()
 
@@ -231,21 +241,6 @@ def get_prediction(
     X_all_poly = poly.transform(X_all.reshape(-1, 1))
 
     preds = model.predict(X_all_poly)
-
-
-    # # Smooth actual
-    # x_smooth = np.linspace(X.min(), X.max(), 200)
-    # actual_spline = make_interp_spline(X, y, k=2)
-    # actual_smooth = actual_spline(x_smooth)
-
-    # # Smooth predicted
-    # x_pred_smooth = np.linspace(X_all.min(), X_all.max(), 300)
-    # pred_spline = make_interp_spline(X_all, preds, k=2)
-    # pred_smooth = pred_spline(x_pred_smooth)
-
-    # # clamp (UI safety)
-    # pred_smooth = np.clip(pred_smooth, 40, 100)
-    # actual_smooth = np.clip(actual_smooth, 40, 100)
 
     chart = []
 
@@ -474,58 +469,46 @@ def department_benchmarks(
     else:
         passed_dept = perf_dept.filter(PerformanceDB.grade >= 50).count()
         dept_pass_rate = (passed_dept * 100.0) / total_dept
-    #  ASSIGNMENTS 
 
-    # assign_course = db.query(AssignmentDB).filter(
-    #     AssignmentDB.course_id == course_id
-    # )
+    assign_course = db.query(AssignmentDB).filter(
+        AssignmentDB.course_id == course_id
+    )
 
-    # assign_course = apply_filters(
-    #     assign_course,
-    #     AssignmentDB,
-    #     course_id,
-    #     semester,
-    #     days,
-    #     from_date,
-    #     to_date,
-    #     join_course=False
-    # )
+    total_assign = assign_course.count()
 
-    # total_assign = assign_course.count()
+    if total_assign == 0:
+        your_assignment_completion = 0
+    else:
+        submitted = (
+            db.query(SubmissionDB.assignment_id)
+            .join(AssignmentDB, SubmissionDB.assignment_id == AssignmentDB.id)
+            .filter(AssignmentDB.course_id == course_id)
+            .distinct()
+            .count()
+        )
 
-    # if total_assign == 0:
-    #     your_assignment_completion = 0
-    # else:
-    #     submitted = assign_course.filter(AssignmentDB.is_submitted == True).count()
-    #     your_assignment_completion = (submitted * 100.0) / total_assign
-
-    # assign_dept = db.query(AssignmentDB)
-
-    # assign_dept = apply_filters(
-    #     assign_dept,
-    #     AssignmentDB,
-    #     None,
-    #     semester,
-    #     days,
-    #     from_date,
-    #     to_date,
-    #     join_course=True
-    # )
-
-    # assign_dept = assign_dept.filter(CourseDB.department == department)
-
-    # total_assign_dept = assign_dept.count()
-
-    # if total_assign_dept == 0:
-    #     dept_assignment_completion = 0
-    # else:
-    #     submitted_dept = assign_dept.filter(
-    #         AssignmentDB.is_submitted == True
-    #     ).count()
-
-    #     dept_assignment_completion = (submitted_dept * 100.0) / total_assign_dept
+    your_assignment_completion = (submitted * 100.0) / total_assign
 
 
+    assign_dept = db.query(AssignmentDB).join(CourseDB)
+
+    assign_dept = assign_dept.filter(CourseDB.department == department)
+
+    total_assign_dept = assign_dept.count()
+
+    if total_assign_dept == 0:
+        dept_assignment_completion = 0
+    else:
+        submitted_dept = (
+            db.query(SubmissionDB.assignment_id)
+            .join(AssignmentDB, SubmissionDB.assignment_id == AssignmentDB.id)
+            .join(CourseDB, AssignmentDB.course_id == CourseDB.id)
+            .filter(CourseDB.department == department)
+            .distinct()
+            .count()
+        )
+
+        dept_assignment_completion = (submitted_dept * 100.0) / total_assign_dept
     benchmarks_list = [
             {
                 "metric": "Average Grade",
@@ -545,18 +528,18 @@ def department_benchmarks(
                 "department": round(dept_attendance, 1),
                 "difference": f"{'+' if your_attendance >= dept_attendance else ''}{round(your_attendance - dept_attendance, 1)}%"
             },
-            # {
-            #     "metric": "Assignment Completion",
-            #     "yourCourse": round(your_assignment_completion, 1),
-            #     "department": round(dept_assignment_completion, 1),
-            #     "difference": f"{'+' if your_assignment_completion >= dept_assignment_completion else ''}{round(your_assignment_completion - dept_assignment_completion, 1)}%"
-            # }
+            {
+                "metric": "Assignment Completion",
+                "yourCourse": round(your_assignment_completion, 1),
+                "department": round(dept_assignment_completion, 1),
+                "difference": f"{'+' if your_assignment_completion >= dept_assignment_completion else ''}{round(your_assignment_completion - dept_assignment_completion, 1)}%"
+            }
             
         ]
     return benchmarks_list
 
-
 def create_grade_chart(perf_data):
+
     labels = list(perf_data.keys())
     values = list(perf_data.values())
 
@@ -564,8 +547,10 @@ def create_grade_chart(perf_data):
     cleaned_labels = []
 
     for l, v in zip(labels, values):
+
         if v is None or (isinstance(v, float) and math.isnan(v)):
             v = 0
+
         cleaned_values.append(v)
         cleaned_labels.append(l)
 
@@ -573,12 +558,33 @@ def create_grade_chart(perf_data):
         cleaned_values = [1]
         cleaned_labels = ["No Data"]
 
-    plt.figure()
+    colors_list = [
+        '#22C55E',
+        '#3B82F6',
+        '#F59E0B',
+        '#EF4444'
+    ]
 
-    plt.pie(cleaned_values, labels=cleaned_labels, autopct="%1.1f%%")
+    plt.figure(figsize=(6, 6))
 
-    path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
-    plt.savefig(path)
+    plt.pie(
+        cleaned_values,
+        labels=cleaned_labels,
+        autopct='%1.1f%%',
+        startangle=140,
+        colors=colors_list,
+        wedgeprops={'edgecolor': 'white'}
+    )
+
+    plt.title("Performance Distribution", fontsize=14)
+
+    path = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".png"
+    ).name
+
+    plt.savefig(path, bbox_inches='tight')
+
     plt.close()
 
     return path
@@ -597,193 +603,678 @@ def create_scatter_chart(points):
     plt.close()
     return path
 
-def export_report(db, config, course_id=None, semester=None, days=None, from_date=None, to_date=None):
+def export_report(
+    db,
+    config,
+    course_id=None,
+    semester=None,
+    days=None,
+    from_date=None,
+    to_date=None
+):
 
     data = {}
 
     if getattr(config, "grade_distribution", False):
-        data["performance"] = get_performance_distribution(db, course_id, semester, days, from_date, to_date)
+        data["performance"] = get_performance_distribution(
+            db, course_id, semester, days, from_date, to_date
+        )
 
     if getattr(config, "predictive_analytics", False):
-        data["prediction"] = get_prediction(db, course_id, semester, days, from_date, to_date)
+        data["prediction"] = get_prediction(
+            db, course_id, semester, days, from_date, to_date
+        )
 
     if getattr(config, "error_analysis_detail", False):
-        data["errors"] = common_error_analysis(db, course_id, semester, days, from_date, to_date)
+        data["errors"] = common_error_analysis(
+            db, course_id, semester, days, from_date, to_date
+        )
 
     if getattr(config, "include_benchmarks", False):
-        data["benchmarks"] = department_benchmarks(db, course_id, semester, days, from_date, to_date)
+        data["benchmarks"] = department_benchmarks(
+            db, course_id, semester, days, from_date, to_date
+        )
 
     if getattr(config, "attendance_data", False):
-        data["correlation"] = get_attendance_correlation_report(db, course_id, semester, days, from_date, to_date)
+        data["correlation"] = get_attendance_correlation_report(
+            db, course_id, semester, days, from_date, to_date
+        )
 
     if getattr(config, "include_pii", False):
-        data["students"] = get_student_insights(db, course_id, semester, days, from_date, to_date)
+        data["students"] = get_student_insights(
+            db, course_id, semester, days, from_date, to_date
+        )
 
+    # =====================================================
+    # PDF EXPORT
+    # =====================================================
 
     if config.export_format == "pdf":
+
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer)
+
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=landscape(letter),
+            rightMargin=18,
+            leftMargin=18,
+            topMargin=18,
+            bottomMargin=18
+        )
+
         styles = getSampleStyleSheet()
+
+        page_width = landscape(letter)[0]
+        usable_width = page_width - 36
+
+        title_style = ParagraphStyle(
+            "TitleStyle",
+            parent=styles["Heading1"],
+            fontSize=24,
+            leading=28,
+            textColor=colors.white,
+            alignment=TA_LEFT
+        )
+
+        subtitle_style = ParagraphStyle(
+            "SubtitleStyle",
+            parent=styles["BodyText"],
+            fontSize=10,
+            leading=14,
+            textColor=colors.white
+        )
+
+        section_style = ParagraphStyle(
+            "SectionStyle",
+            parent=styles["Heading2"],
+            fontSize=15,
+            leading=18,
+            textColor=colors.HexColor("#111827"),
+            spaceAfter=8,
+            spaceBefore=10
+        )
+
+        description_style = ParagraphStyle(
+            "DescriptionStyle",
+            parent=styles["BodyText"],
+            fontSize=9,
+            leading=14,
+            textColor=colors.HexColor("#4B5563")
+        )
+
         elements = []
 
-        
-        elements.append(Paragraph("Analytics Report", styles["Title"]))
-        elements.append(Spacer(1, 20))
+        # =====================================================
+        # HEADER FULL WIDTH
+        # =====================================================
 
-        # STUDENTS 
-        if "students" in data:
+        generated_date = datetime.now().strftime("%d %b %Y")
 
-            elements.append(Paragraph(" Students Information", styles["Heading2"]))
-            elements.append(Spacer(1, 10))
+        logo = Image(
+            "assets/logo.jpeg",
+            width=55,
+            height=55
+        )
 
-            rows = [["Student ID", "Name", "Department"]]
+        title = Paragraph(
+            "<b>ProFound Academic Analytics Report</b>",
+            title_style
+        )
 
-            for s in data["students"]["students"]:
-                rows.append([
-                    s["id"],
-                    s["name"],
-                    s["department"]
-                ])
+        subtitle = Paragraph(
+            f"""
+            Professional academic performance and student analytics dashboard.<br/>
+            Generated on {generated_date}
+            """,
+            subtitle_style
+        )
 
-            table = Table(rows, hAlign="CENTER")
+        header_content = Table(
+            [
+                [
+                    [title, subtitle],
+                    logo
+                ]
+            ],
+            colWidths=[usable_width - 90, 70]
+        )
 
-            table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkblue),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ]))
+        header_content.setStyle(TableStyle([
 
-            elements.append(table)
-            elements.append(Spacer(1, 20))
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
 
-        #  CORRELATION 
-        if "correlation" in data and "points" in data["correlation"]:
+            ('LEFTPADDING', (0,0), (-1,-1), 18),
+            ('RIGHTPADDING', (0,0), (-1,-1), 18),
 
-            elements.append(Paragraph("Attendance vs Grade Correlation", styles["Heading2"]))
-            elements.append(Spacer(1, 10))
+            ('TOPPADDING', (0,0), (-1,-1), 16),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 16),
 
-            chart_path = create_scatter_chart(data["correlation"]["points"])
-            elements.append(Image(chart_path, width=400, height=300))
-            elements.append(Spacer(1, 20))
+        ]))
 
-        #  PERFORMANCE
-        if "performance" in data:
+        header = Table(
+            [[header_content]],
+            colWidths=[usable_width]
+        )
 
-            elements.append(Paragraph("📊 Grade Distribution", styles["Heading2"]))
-            elements.append(Spacer(1, 10))
+        header.setStyle(TableStyle([
+
+            ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#10B981")),
+
+            ('BOX', (0,0), (-1,-1), 0, colors.white),
+
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+
+            ('TOPPADDING', (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+
+        ]))
+
+        elements.append(header)
+
+        elements.append(Spacer(1, 18))
+
+        # =====================================================
+        # PERFORMANCE CHART
+        # =====================================================
+
+        if (
+            "performance" in data
+            and data["performance"]
+            and len(data["performance"]) > 0
+        ):
+
+            elements.append(
+                Paragraph(
+                    "Grade Distribution",
+                    section_style
+                )
+            )
+
+            elements.append(
+                Paragraph(
+                    """
+                    This section presents the overall grade distribution
+                    of students enrolled in the selected course. The chart
+                    provides a visual overview of academic performance levels
+                    and helps identify achievement trends.
+                    """,
+                    description_style
+                )
+            )
+
+            elements.append(Spacer(1, 6))
 
             chart_path = create_grade_chart(data["performance"])
-            elements.append(Image(chart_path, width=400, height=300))
-            elements.append(Spacer(1, 20))
 
-        #  PREDICTION
-        if "prediction" in data:
+            elements.append(
+                Image(
+                    chart_path,
+                    width=420,
+                    height=220
+                )
+            )
 
-            elements.append(Paragraph(" Predictive Analytics", styles["Heading2"]))
-            elements.append(Spacer(1, 10))
+            elements.append(Spacer(1, 14))
 
-            rows = [["Week", "Actual", "Predicted", "At-Risk"]]
+        # =====================================================
+        # CORRELATION CHART
+        # =====================================================
 
-            for c in data["prediction"].get("chart", []):
-                rows.append([
-                    c.get("label"),
-                    c.get("actual", "-"),
-                    c.get("predicted", "-"),
-                    c.get("at_risk_students", "-")
+        if (
+            "correlation" in data
+            and data["correlation"]
+            and data["correlation"].get("points")
+        ):
+
+            elements.append(
+                Paragraph(
+                    "Attendance Correlation",
+                    section_style
+                )
+            )
+
+            elements.append(
+                Paragraph(
+                    """
+                    This analysis illustrates the relationship between
+                    attendance rates and student academic performance.
+                    The scatter chart assists instructors in identifying
+                    how attendance behavior may impact grades.
+                    """,
+                    description_style
+                )
+            )
+
+            elements.append(Spacer(1, 6))
+
+            scatter_path = create_scatter_chart(
+                data["correlation"]["points"]
+            )
+
+            elements.append(
+                Image(
+                    scatter_path,
+                    width=420,
+                    height=220
+                )
+            )
+
+            elements.append(Spacer(1, 14))
+
+        # =====================================================
+        # PREDICTIVE ANALYTICS
+        # =====================================================
+
+        prediction_chart = []
+
+        if (
+            "prediction" in data
+            and data["prediction"]
+        ):
+
+            prediction_chart = data["prediction"].get("chart", [])
+
+        if len(prediction_chart) > 0:
+
+            elements.append(
+                Paragraph(
+                    "Predictive Analytics",
+                    section_style
+                )
+            )
+
+            elements.append(
+                Paragraph(
+                    """
+                    Predictive analytics compares actual academic outcomes
+                    with forecasted performance values. This section supports
+                    early identification of performance patterns and future
+                    academic expectations.
+                    """,
+                    description_style
+                )
+            )
+
+            elements.append(Spacer(1, 6))
+
+            prediction_rows = [
+                ["Week", "Actual", "Predicted"]
+            ]
+
+            for row in prediction_chart[:6]:
+
+                prediction_rows.append([
+                    str(row.get("label", "-")),
+                    str(row.get("actual", "-")),
+                    str(row.get("predicted", "-"))
                 ])
 
-            table = Table(rows, hAlign="CENTER")
+            prediction_table = Table(
+                prediction_rows,
+                colWidths=[180, 180, 180]
+            )
 
-            table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkgreen),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            prediction_table.setStyle(TableStyle([
+
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#10B981")),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D1D5DB")),
+
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+
+                ('TOPPADDING', (0,0), (-1,-1), 7),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+
             ]))
 
-            elements.append(table)
-            elements.append(Spacer(1, 20))
+            elements.append(prediction_table)
 
-        #  BENCHMARKS
-        if "benchmarks" in data:
+            elements.append(Spacer(1, 14))
 
-            elements.append(Paragraph(" Department Benchmarks", styles["Heading2"]))
-            elements.append(Spacer(1, 10))
+        # =====================================================
+        # BENCHMARKS
+        # =====================================================
 
-            rows = [["Metric", "Your Course", "Department", "Difference"]]
+        if (
+            "benchmarks" in data
+            and data["benchmarks"]
+            and len(data["benchmarks"]) > 0
+        ):
 
-            for b in data["benchmarks"]:
-                rows.append([
-                    b["metric"],
-                    b["yourCourse"],
-                    b["department"],
-                    b["difference"]
+            elements.append(
+                Paragraph(
+                    "Department Benchmarks",
+                    section_style
+                )
+            )
+
+            elements.append(
+                Paragraph(
+                    """
+                    Department benchmarks compare course performance metrics
+                    against departmental averages. This comparison provides
+                    insight into relative course effectiveness and academic quality.
+                    """,
+                    description_style
+                )
+            )
+
+            elements.append(Spacer(1, 6))
+
+            benchmark_rows = [
+                ["Metric", "Course", "Department"]
+            ]
+
+            for b in data["benchmarks"][:6]:
+
+                benchmark_rows.append([
+                    str(b["metric"]),
+                    str(b["yourCourse"]),
+                    str(b["department"])
                 ])
 
-            table = Table(rows, hAlign="CENTER")
+            benchmark_table = Table(
+                benchmark_rows,
+                colWidths=[300, 120, 120]
+            )
 
-            table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkblue),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            benchmark_table.setStyle(TableStyle([
+
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#10B981")),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D1D5DB")),
+
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+
+                ('TOPPADDING', (0,0), (-1,-1), 7),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+
             ]))
 
-            elements.append(table)
-            elements.append(Spacer(1, 20))
+            elements.append(benchmark_table)
 
-        #  ERROR ANALYSIS 
+            elements.append(Spacer(1, 14))
 
-        if "errors" in data and data["errors"]:
+        # =====================================================
+        # STUDENTS INFORMATION
+        # =====================================================
 
-            elements.append(Paragraph(" Error Analysis", styles["Heading2"]))
-            elements.append(Spacer(1, 10))
+        students_list = []
 
-            rows = [["Category", "Type", "Common Mistake"]]
+        if (
+            "students" in data
+            and data["students"]
+        ):
 
-            for category in data["errors"]:
-                cat_name = category["category"]
+            students_list = data["students"].get("students", [])
 
-                for pattern in category.get("patterns", []):
-                    rows.append([
-                        cat_name,
-                        pattern.get("error_type", "-"),
-                        f"Occurs {pattern.get('occurrences', 0)} times"
+        if len(students_list) > 0:
+
+            elements.append(
+                Paragraph(
+                    "Students Information",
+                    section_style
+                )
+            )
+
+            elements.append(
+                Paragraph(
+                    """
+                    This section provides a summary of student information
+                    included in the generated report. It supports academic
+                    tracking, departmental analysis, and institutional reporting.
+                    """,
+                    description_style
+                )
+            )
+
+            elements.append(Spacer(1, 6))
+
+            student_rows = [
+                ["Student ID", "Name", "Department"]
+            ]
+
+            for s in students_list[:8]:
+
+                student_rows.append([
+                    str(s["id"]),
+                    str(s["name"]),
+                    str(s["department"])
+                ])
+
+            students_table = Table(
+                student_rows,
+                colWidths=[150, 260, 180]
+            )
+
+            students_table.setStyle(TableStyle([
+
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#10B981")),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D1D5DB")),
+
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+
+                ('TOPPADDING', (0,0), (-1,-1), 7),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+
+            ]))
+
+            elements.append(students_table)
+
+            elements.append(Spacer(1, 14))
+
+        # =====================================================
+        # ERROR ANALYSIS
+        # =====================================================
+
+        if (
+            "errors" in data
+            and data["errors"]
+            and len(data["errors"]) > 0
+        ):
+
+            error_rows = [
+                ["Category", "Error Type", "Occurrences"]
+            ]
+
+            for category in data["errors"][:5]:
+
+                for pattern in category.get("patterns", [])[:2]:
+
+                    error_rows.append([
+                        str(category["category"]),
+                        str(pattern.get("error_type", "-")),
+                        str(pattern.get("occurrences", 0))
                     ])
 
-            table = Table(rows, hAlign="CENTER")
+            if len(error_rows) > 1:
 
-            table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.red),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ]))
+                elements.append(
+                    Paragraph(
+                        "Error Analysis",
+                        section_style
+                    )
+                )
 
-            elements.append(table)
-            elements.append(Spacer(1, 20))
+                elements.append(
+                    Paragraph(
+                        """
+                        Error analysis identifies the most frequent academic
+                        or assessment-related issues observed in the selected
+                        course. This information helps instructors improve
+                        teaching strategies and student outcomes.
+                        """,
+                        description_style
+                    )
+                )
 
+                elements.append(Spacer(1, 6))
 
+                error_table = Table(
+                    error_rows,
+                    colWidths=[260, 260, 120]
+                )
+
+                error_table.setStyle(TableStyle([
+
+                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#10B981")),
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D1D5DB")),
+
+                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+
+                    ('FONTSIZE', (0,0), (-1,-1), 9),
+
+                    ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+
+                    ('TOPPADDING', (0,0), (-1,-1), 7),
+                    ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+
+                ]))
+
+                elements.append(error_table)
+
+        # =====================================================
         # BUILD PDF
+        # =====================================================
 
-            doc.build(elements)
-            buffer.seek(0)
+        doc.build(elements)
 
-            return StreamingResponse(
-                buffer,
-                media_type="application/pdf",
-                headers={"Content-Disposition": "attachment; filename=report.pdf"}
-            )
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": "attachment; filename=analytics_report.pdf"
+            }
+        )
+
+    # =====================================================
+    # EXCEL EXPORT
+    # =====================================================
+
     elif config.export_format == "excel":
 
         buffer = io.BytesIO()
 
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
-    
-            #  STUDENTS SHEET
-    
+            if "students" in data and data["students"].get("students"):
+
+                students_rows = [
+                    {
+                        "Student ID": s["id"],
+                        "Name": s["name"],
+                        "Department": s["department"]
+                    }
+                    for s in data["students"]["students"]
+                ]
+
+                pd.DataFrame(students_rows).to_excel(
+                    writer,
+                    sheet_name="Students",
+                    index=False
+                )
+
+            if "benchmarks" in data and data["benchmarks"]:
+
+                pd.DataFrame(data["benchmarks"]).to_excel(
+                    writer,
+                    sheet_name="Benchmarks",
+                    index=False
+                )
+
+            if "errors" in data and data["errors"]:
+
+                error_rows = []
+
+                for category in data["errors"]:
+
+                    for pattern in category.get("patterns", []):
+
+                        error_rows.append({
+                            "Category": category.get("category", "-"),
+                            "Type": pattern.get("error_type", "-"),
+                            "Occurrences": pattern.get("occurrences", 0),
+                        })
+
+                if len(error_rows) > 0:
+
+                    pd.DataFrame(error_rows).to_excel(
+                        writer,
+                        sheet_name="Errors",
+                        index=False
+                    )
+
+            if "performance" in data and data["performance"]:
+
+                perf_rows = [
+                    {
+                        "Category": k,
+                        "Count": v
+                    }
+                    for k, v in data["performance"].items()
+                ]
+
+                pd.DataFrame(perf_rows).to_excel(
+                    writer,
+                    sheet_name="Performance",
+                    index=False
+                )
+
+            if (
+                "prediction" in data
+                and data["prediction"]
+                and data["prediction"].get("chart")
+            ):
+
+                pd.DataFrame(
+                    data["prediction"]["chart"]
+                ).to_excel(
+                    writer,
+                    sheet_name="Prediction",
+                    index=False
+                )
+
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": "attachment; filename=analytics_report.xlsx"
+            }
+        )
+
+    # =====================================================
+    # EXCEL EXPORT
+    # =====================================================
+
+    elif config.export_format == "excel":
+
+        buffer = io.BytesIO()
+
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+
             if "students" in data:
 
                 students_rows = [
@@ -801,9 +1292,6 @@ def export_report(db, config, course_id=None, semester=None, days=None, from_dat
                     index=False
                 )
 
-    
-            #  BENCHMARKS SHEET
-    
             if "benchmarks" in data:
 
                 pd.DataFrame(data["benchmarks"]).to_excel(
@@ -812,22 +1300,18 @@ def export_report(db, config, course_id=None, semester=None, days=None, from_dat
                     index=False
                 )
 
-    
-            #  ERRORS SHEET 
-    
             if "errors" in data and data["errors"]:
 
                 error_rows = []
 
                 for category in data["errors"]:
-                    cat_name = category.get("category", "-")
 
                     for pattern in category.get("patterns", []):
+
                         error_rows.append({
-                            "Category": cat_name,
+                            "Category": category.get("category", "-"),
                             "Type": pattern.get("error_type", "-"),
                             "Occurrences": pattern.get("occurrences", 0),
-                            "Affected Students": pattern.get("affected_students", 0)
                         })
 
                 pd.DataFrame(error_rows).to_excel(
@@ -836,9 +1320,6 @@ def export_report(db, config, course_id=None, semester=None, days=None, from_dat
                     index=False
                 )
 
-    
-            #  PERFORMANCE SHEET
-    
             if "performance" in data:
 
                 perf_rows = [
@@ -855,9 +1336,6 @@ def export_report(db, config, course_id=None, semester=None, days=None, from_dat
                     index=False
                 )
 
-    
-            # PREDICTION SHEET 
-    
             if "prediction" in data:
 
                 pred = data["prediction"]
@@ -875,5 +1353,7 @@ def export_report(db, config, course_id=None, semester=None, days=None, from_dat
         return StreamingResponse(
             buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=report.xlsx"}
+            headers={
+                "Content-Disposition": "attachment; filename=report.xlsx"
+            }
         )

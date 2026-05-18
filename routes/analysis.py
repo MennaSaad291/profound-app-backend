@@ -110,18 +110,40 @@ def full_analysis(data: AnalysisRequest, db: Session = Depends(get_db)):
     course_id = data.course_id
     semester = data.semester
     days = data.days
+    from_date = data.from_date
+    to_date = data.to_date
 
     return {
         "performanceDistribution": analytics_service.get_performance_distribution(
-            db, course_id, semester, days
-        ),
+    db,
+    course_id,
+    semester,
+    days,
+    from_date,
+    to_date
+),
         "correlation": analytics_service.get_attendance_correlation_report(
-            db, course_id, semester, days
-        ),
+    db,
+    course_id,
+    semester,
+    days,
+    from_date,
+    to_date
+),
         "prediction": analytics_service.get_prediction(
-            db, course_id, semester, days
-        ),
+    db,
+    course_id,
+    semester,
+    days,
+    from_date,
+    to_date
+),
         "errorAnalysis": analytics_service.common_error_analysis(
-            db, course_id, semester, days
-        ),
+    db,
+    course_id,
+    semester,
+    days,
+    from_date,
+    to_date
+),
     }
