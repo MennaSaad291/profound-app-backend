@@ -292,6 +292,82 @@ async def export_pptx_alias(data: dict):
 def get_courses(user_id: int, db: Session = Depends(get_db)):
     return db.query(CourseDB).filter(CourseDB.user_id == user_id).all()
 
+@app.get("/dashboard-stats/{user_id}")
+def get_dashboard_stats(user_id: int, db: Session = Depends(get_db)):
+    """
+    Returns real-time dashboard metrics for a professor:
+    - class_average: mean grade across all graded submissions in all their courses
+    - at_risk_count: students with avg grade < 60 across their courses
+    - pending_grading: submissions with status 'pending' or 'ready' (not yet finalized)
+    - total_students: total enrolled students across all courses
+    - total_courses: number of active courses
+    """
+    # Get all this professor's courses
+    courses = db.query(CourseDB).filter(CourseDB.user_id == user_id).all()
+    course_ids = [c.id for c in courses]
+
+    if not course_ids:
+        return {
+            "class_average": 0.0,
+            "average_trend": 0.0,
+            "at_risk_count": 0,
+            "pending_grading": 0,
+            "total_students": 0,
+            "total_courses": 0,
+        }
+
+    # ── Class average from graded submissions ──
+    graded_subs = (
+        db.query(SubmissionDB)
+        .join(AssignmentDB, SubmissionDB.assignment_id == AssignmentDB.id)
+        .filter(
+            AssignmentDB.course_id.in_(course_ids),
+            SubmissionDB.status == "graded",
+            SubmissionDB.ai_grade.isnot(None),
+        )
+        .all()
+    )
+    grades = [s.ai_grade for s in graded_subs if s.ai_grade is not None]
+    class_average = round(sum(grades) / len(grades), 1) if grades else 0.0
+
+    # ── At-risk: students whose average grade < 60 ──
+    student_grade_map = {}
+    for s in graded_subs:
+        key = s.student_name or f"sub_{s.id}"
+        student_grade_map.setdefault(key, []).append(s.ai_grade)
+    at_risk_count = sum(
+        1 for g_list in student_grade_map.values()
+        if (sum(g_list) / len(g_list)) < 60
+    )
+
+    # ── Pending grading: submissions not yet finalized ──
+    pending_grading = (
+        db.query(SubmissionDB)
+        .join(AssignmentDB, SubmissionDB.assignment_id == AssignmentDB.id)
+        .filter(
+            AssignmentDB.course_id.in_(course_ids),
+            SubmissionDB.status.in_(["pending", "ready"]),
+        )
+        .count()
+    )
+
+    # ── Total students ──
+    total_students = (
+        db.query(StudentDB)
+        .filter(StudentDB.course_id.in_(course_ids))
+        .count()
+    )
+
+    return {
+        "class_average": class_average,
+        "average_trend": 0.0,   # can be enhanced with historical data
+        "at_risk_count": at_risk_count,
+        "pending_grading": pending_grading,
+        "total_students": total_students,
+        "total_courses": len(courses),
+    }
+
+
 
 @app.post("/api/grade-essay/{submission_id}")
 async def grade_essay(submission_id: int, db: Session = Depends(get_db)):
