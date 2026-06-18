@@ -283,84 +283,86 @@ def get_prediction(
             "at_risk_students": int(last_risk)
         }
     }
-### common_error_analysis 
+### common_error_analysis
 def common_error_analysis(db, course_id=None, semester=None, days=None, from_date=None, to_date=None):
+    """
+    Returns one entry per error category (Conceptual, Structural, Language,
+    Completeness) with:
+      - total_errors   : how many submissions had at least one error in this category
+      - percentage     : share of that category out of all error rows
+      - affected_students : distinct students who had this category of error
+      - notes          : list of the AI-generated descriptions (one per submission)
+                         so the professor can read actual error details
 
-    query = db.query(ErrorAnalysisDB)
+    The old approach tried to GROUP BY error_type (raw AI text) which produced
+    occurrences=1 / affected_students=1 for every row because every AI description
+    is unique text.  We no longer aggregate by description — descriptions are
+    shown as individual notes instead.
+    """
 
-    query = apply_filters(
-        query,
-        ErrorAnalysisDB,
-        course_id,
-        semester,
-        days,
-        from_date,
-        to_date,
+    # ── base filtered query ───────────────────────────────────────────────
+    base_q = db.query(ErrorAnalysisDB)
+    base_q = apply_filters(
+        base_q, ErrorAnalysisDB,
+        course_id, semester, days, from_date, to_date,
         join_course=True
     )
 
-    total_errors = query.count()
-
+    total_errors = base_q.count()
     if total_errors == 0:
         return []
 
-    categories = db.query(
+    # ── Step 1: count rows per category ──────────────────────────────────
+    cat_q = db.query(
         ErrorAnalysisDB.error_category,
-        func.count(ErrorAnalysisDB.id).label("count")
+        func.count(ErrorAnalysisDB.id).label("count"),
+        func.count(func.distinct(ErrorAnalysisDB.student_id)).label("students"),
+    )
+    cat_q = apply_filters(
+        cat_q, ErrorAnalysisDB,
+        course_id, semester, days, from_date, to_date,
+        join_course=True
+    )
+    categories = (
+        cat_q
+        .group_by(ErrorAnalysisDB.error_category)
+        .order_by(func.count(ErrorAnalysisDB.id).desc())   # highest-frequency first
+        .all()
     )
 
-    categories = apply_filters(
-        categories,
-        ErrorAnalysisDB,
-        course_id,
-        semester,
-        days,
-        from_date,
-        to_date,
+    # ── Step 2: fetch all individual descriptions per category ───────────
+    #   We order by newest first so the professor sees recent errors at the top.
+    rows_q = db.query(
+        ErrorAnalysisDB.error_category,
+        ErrorAnalysisDB.error_type,
+        ErrorAnalysisDB.assignment_name,
+        ErrorAnalysisDB.created_at,
+    )
+    rows_q = apply_filters(
+        rows_q, ErrorAnalysisDB,
+        course_id, semester, days, from_date, to_date,
         join_course=True
-    ).group_by(ErrorAnalysisDB.error_category).all()
+    )
+    all_rows = rows_q.order_by(ErrorAnalysisDB.created_at.desc()).all()
 
+    # Group descriptions by category into a dict for O(1) lookup
+    notes_by_category: dict[str, list[dict]] = {}
+    for row in all_rows:
+        notes_by_category.setdefault(row.error_category, []).append({
+            "description": row.error_type,
+            "assignment":  row.assignment_name,
+        })
+
+    # ── Step 3: build result ──────────────────────────────────────────────
     result = []
-
     for cat in categories:
-
-        percentage = (cat.count / total_errors) * 100
-
-        error_types_query = db.query(
-            ErrorAnalysisDB.error_type,
-            func.count(ErrorAnalysisDB.id).label("count"),
-            func.count(func.distinct(ErrorAnalysisDB.student_id)).label("students")
-        )
-
-        error_types_query = apply_filters(
-            error_types_query,
-            ErrorAnalysisDB,
-            course_id,
-            semester,
-            days,
-            from_date,
-            to_date,
-            join_course=True
-        )
-
-        error_types_query = error_types_query.filter(
-            ErrorAnalysisDB.error_category == cat.error_category
-        ).group_by(ErrorAnalysisDB.error_type).all()
-
-        patterns = []
-
-        for e in error_types_query:
-            patterns.append({
-                "error_type": e.error_type,
-                "occurrences": e.count,
-                "affected_students": e.students
-            })
-
         result.append({
-            "category": cat.error_category,
-            "total_errors": cat.count,
-            "percentage": round(percentage, 2),
-            "patterns": patterns
+            "category":          cat.error_category,
+            "total_errors":      cat.count,
+            "percentage":        round((cat.count / total_errors) * 100, 2),
+            "affected_students": cat.students,
+            # individual AI descriptions — shown as readable notes, not aggregated
+            "notes":             notes_by_category.get(cat.error_category, []),
         })
 
     return result
@@ -1089,20 +1091,26 @@ def export_report(
             and data["errors"]
             and len(data["errors"]) > 0
         ):
-
+            # New shape: category / total_errors / percentage /
+            #            affected_students / notes[{description, assignment}]
             error_rows = [
-                ["Category", "Error Type", "Occurrences"]
+                ["Category", "Affected Students", "% of Errors", "Description (latest)"]
             ]
 
             for category in data["errors"][:5]:
+                notes = category.get("notes", [])
+                # Take the most recent note as a representative description
+                latest_note = notes[0].get("description", "-") if notes else "-"
+                # Truncate long descriptions so they fit in the PDF cell
+                if len(latest_note) > 120:
+                    latest_note = latest_note[:117] + "..."
 
-                for pattern in category.get("patterns", [])[:2]:
-
-                    error_rows.append([
-                        str(category["category"]),
-                        str(pattern.get("error_type", "-")),
-                        str(pattern.get("occurrences", 0))
-                    ])
+                error_rows.append([
+                    str(category["category"]),
+                    str(category.get("affected_students", 0)),
+                    f"{category.get('percentage', 0)}%",
+                    latest_note,
+                ])
 
             if len(error_rows) > 1:
 
@@ -1129,7 +1137,7 @@ def export_report(
 
                 error_table = Table(
                     error_rows,
-                    colWidths=[260, 260, 120]
+                    colWidths=[100, 90, 70, 380]
                 )
 
                 error_table.setStyle(TableStyle([
@@ -1143,10 +1151,15 @@ def export_report(
 
                     ('FONTSIZE', (0,0), (-1,-1), 9),
 
-                    ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                    # Left-align the description column for readability
+                    ('ALIGN', (0,0), (2,-1), 'CENTER'),
+                    ('ALIGN', (3,0), (3,-1), 'LEFT'),
+
+                    ('VALIGN', (0,0), (-1,-1), 'TOP'),
 
                     ('TOPPADDING', (0,0), (-1,-1), 7),
                     ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+                    ('LEFTPADDING', (3,1), (3,-1), 6),
 
                 ]))
 

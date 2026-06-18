@@ -542,7 +542,6 @@ async def create_assignment(
 
 @app.get("/assignments-with-submissions/{course_id}")
 async def get_nested_assignments(course_id: int, db: Session = Depends(get_db)):
-    # Optimization: Use joinedload if your relationships are set up in models.py
     assignments = db.query(AssignmentDB).filter(AssignmentDB.course_id == course_id).all()
     result = []
     for assign in assignments:
@@ -557,9 +556,14 @@ async def get_nested_assignments(course_id: int, db: Session = Depends(get_db)):
                 {
                     "id": s.id,
                     "student_name": s.student_name,
-                    "ai_grade": s.ai_grade,
                     "status": s.status,
-                    "grade_report": s.grade_report
+                    # ai_grade: original AI score, never overwritten
+                    "ai_grade": s.ai_grade,
+                    # manual_grade: professor's override — null means no override yet
+                    "manual_grade": s.manual_grade,
+                    # final_grade: what to display — professor's value if set, else AI
+                    "final_grade": s.manual_grade if s.manual_grade is not None else s.ai_grade,
+                    "grade_report": s.grade_report,
                 } for s in subs
             ]
         })
@@ -571,12 +575,20 @@ async def get_nested_assignments(course_id: int, db: Session = Depends(get_db)):
 async def grade_student(
     assignment_id: int,
     file: UploadFile = File(...),
+    # Fix 1: accept feedback_tone from the Flutter client.
+    # Falls back to "formal" if the client does not send it.
+    feedback_tone: Optional[str] = Form("formal"),
     db: Session = Depends(get_db)
 ):
     assign = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
 
     if not assign:
         raise HTTPException(status_code=404, detail="Assignment not found")
+
+    # Validate tone value — only allow the three supported options
+    valid_tones = {"formal", "encouraging", "strict"}
+    if feedback_tone not in valid_tones:
+        feedback_tone = "formal"
 
     # ------------------------
     # Save + extract student file
@@ -612,6 +624,7 @@ async def grade_student(
     # ------------------------
     print("\n========== DEBUG START ==========")
     print("Student Answer:\n", student_text[:500])
+    print("Feedback Tone:", feedback_tone)
     print("Assignment Question:\n", assign.assignment_question)
     print("Model Answer:\n", assign.model_answer if assign.is_model_answer else "None")
     print("Rubric:\n", assign.rubric if not assign.is_model_answer else "None")
@@ -644,13 +657,13 @@ RUBRIC:
     print("FINAL REFERENCE SENT TO AI:\n", reference)
 
     # ------------------------
-    # CALL AI
+    # CALL AI  (Fix 1: pass the professor's chosen tone)
     # ------------------------
     ai_report = perform_nlp_grading(
         student_text=student_text,
         mode=mode,
         reference=reference,
-        feedback_tone="formal"  # default; can be per-professor setting later
+        feedback_tone=feedback_tone,
     )
 
     print("AI RESPONSE:\n", ai_report)
@@ -665,27 +678,88 @@ RUBRIC:
         status="ready",
         ai_grade=ai_report.get('score_out_of_100', 0),
         grade_report=ai_report,
-        essay_content=student_text
+        essay_content=student_text,
     )
 
     db.add(new_sub)
+    db.flush()   # get new_sub.id before the error-analysis insert below
+
+    # ─────────────────────────────────────────────────────────────────
+    # Fix 3: Populate ErrorAnalysisDB from the AI error_categories.
+    #
+    # The AI returns a dict like:
+    #   {
+    #     "conceptual":   "Student misunderstood X ...",
+    #     "structural":   null,
+    #     "language":     "Several run-on sentences ...",
+    #     "completeness": null
+    #   }
+    #
+    # We write one ErrorAnalysisDB row per non-null category so that
+    # the analytics dashboard can query real error trends over time.
+    # ─────────────────────────────────────────────────────────────────
+    error_categories: dict = ai_report.get("error_categories", {}) or {}
+
+    # Map AI category keys → human-readable category labels
+    category_label_map = {
+        "conceptual":   "Conceptual",
+        "structural":   "Structural",
+        "language":     "Language",
+        "completeness": "Completeness",
+    }
+
+    # Try to resolve the student DB record for the FK.
+    # The submission filename is used as student_name; if a matching
+    # StudentDB row exists we link it, otherwise we skip the FK.
+    student_name = file.filename.split('.')[0]
+    student_record = (
+        db.query(StudentDB)
+        .filter(StudentDB.name == student_name,
+                StudentDB.course_id == assign.course_id)
+        .first()
+    )
+
+    for category_key, description in error_categories.items():
+        # Skip null / empty entries — no error in that category
+        if not description or str(description).strip().lower() in ("null", "none", ""):
+            continue
+
+        label = category_label_map.get(category_key, category_key.capitalize())
+
+        error_row = ErrorAnalysisDB(
+            student_id=student_record.id if student_record else None,
+            course_id=assign.course_id,
+            assignment_name=assign.assignment_name,
+            error_category=label,
+            # Store the AI's descriptive text as the specific error type
+            error_type=str(description)[:500],   # cap at 500 chars
+        )
+        db.add(error_row)
+
     db.commit()
 
     return {
         "status": "success",
         "grade": ai_report.get("score_out_of_100", 0),
         "mode": mode,
-        "report": ai_report
+        "feedback_tone": feedback_tone,
+        "report": ai_report,
     }
 
 
 @app.put("/update-submission-grade/{submission_id}")
 async def update_grade(submission_id: int, data: dict, db: Session = Depends(get_db)):
+    """
+    Called when the professor finalises a grade in the review dialog.
+    Writes the professor's value to manual_grade only — ai_grade is
+    never touched so the original AI score is always preserved.
+    """
     submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
 
-    submission.ai_grade = data['final_grade']  # Overwriting with the manual adjustment
+    submission.manual_grade = int(data['final_grade'])
+    submission.status = "graded"
     db.commit()
     return {"message": "Success"}
 
