@@ -649,7 +649,8 @@ RUBRIC:
     ai_report = perform_nlp_grading(
         student_text=student_text,
         mode=mode,
-        reference=reference
+        reference=reference,
+        feedback_tone="formal"  # default; can be per-professor setting later
     )
 
     print("AI RESPONSE:\n", ai_report)
@@ -698,18 +699,19 @@ from services.grading_service import perform_nlp_grading
 @app.post("/analyze-general-submission")
 async def analyze_general(data: dict):
     student_text = data.get("student_text")
-    mode = data.get("mode") # "MODEL" or "RUBRIC"
+    mode = data.get("mode")  # "MODEL" or "RUBRIC"
     reference = data.get("reference_content")
+    feedback_tone = data.get("feedback_tone", "formal")  # optional
 
     if not all([student_text, mode, reference]):
         raise HTTPException(status_code=400, detail="Missing required fields")
 
-    # Call your existing AI logic
     try:
         report = perform_nlp_grading(
             student_text=student_text,
             mode=mode,
-            reference=reference
+            reference=reference,
+            feedback_tone=feedback_tone
         )
         return report
     except Exception as e:
