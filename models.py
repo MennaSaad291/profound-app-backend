@@ -100,7 +100,15 @@ class SubmissionDB(Base):
     question_type = Column(String, default="Essay")
     status = Column(String, default="pending")  # 'pending', 'ready', or 'graded'
 
+    # ai_grade is set once by the AI and NEVER overwritten afterwards.
+    # This preserves the original AI score so it can be compared with
+    # the professor's manual adjustment at any time.
     ai_grade = Column(Integer, nullable=True)
+
+    # manual_grade is set ONLY when the professor explicitly overrides the AI.
+    # null means the professor accepted the AI grade without change.
+    manual_grade = Column(Integer, nullable=True)
+
     plagiarism_score = Column(Integer, nullable=True)
     essay_content = Column(Text, nullable=True)
 
@@ -119,11 +127,12 @@ class PerformanceDB(Base):
 class ErrorAnalysisDB(Base):
     __tablename__ = "error_analysis"
     id = Column(Integer, primary_key=True)
-    student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"))
+    # nullable=True: we may not always find a matching StudentDB row by name
+    student_id = Column(Integer, ForeignKey("students.id", ondelete="CASCADE"), nullable=True)
     course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"))
     assignment_name = Column(String)
-    error_category = Column(String)
-    error_type = Column(String)  
+    error_category = Column(String)   # "Conceptual" | "Structural" | "Language" | "Completeness"
+    error_type = Column(String)       # AI-generated description of the specific error
     created_at = Column(DateTime, default=func.now())
 
     
