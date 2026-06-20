@@ -93,10 +93,8 @@ THEMES = {
 _W = Inches(13.333)
 _H = Inches(7.5)
 
-
 def _rgb(t: tuple) -> RGBColor:
     return RGBColor(t[0], t[1], t[2])
-
 
 def _rect(slide, left, top, width, height, color: tuple):
     s = slide.shapes.add_shape(1, left, top, width, height)
@@ -105,7 +103,6 @@ def _rect(slide, left, top, width, height, color: tuple):
     s.line.fill.background()
     return s
 
-
 def _oval(slide, left, top, width, height, color: tuple):
     s = slide.shapes.add_shape(9, left, top, width, height)
     s.fill.solid()
@@ -113,12 +110,10 @@ def _oval(slide, left, top, width, height, color: tuple):
     s.line.fill.background()
     return s
 
-
 def _tb(slide, left, top, width, height):
     box = slide.shapes.add_textbox(left, top, width, height)
     box.text_frame.word_wrap = True
     return box.text_frame
-
 
 def _para(tf, text: str, size: float, bold: bool, color: tuple,
           align=PP_ALIGN.LEFT, space_before: float = 0, italic: bool = False):
@@ -137,7 +132,6 @@ def _para(tf, text: str, size: float, bold: bool, color: tuple,
         p.space_before = Pt(space_before)
     return p
 
-
 def _extract_point(pt) -> tuple[str, str]:
     """
     Safely extract (headline, detail) from a point that may be
@@ -150,7 +144,6 @@ def _extract_point(pt) -> tuple[str, str]:
         det = str(pt.get("detail",   pt.get("explanation", ""))).strip()
         return hl, det
     return str(pt).strip(), ""
-
 
 def create_pptx(data: dict) -> io.BytesIO:
     theme_name  = data.get("theme", "Modern Minimalist")
@@ -182,7 +175,6 @@ def create_pptx(data: dict) -> io.BytesIO:
         notes       = str(sd.get("speaker_notes", "") or "").strip()
         prof_text   = str(sd.get("professor_text","") or "").strip()
 
-
         # ── Slide background ──────────────────────────────────────
         _rect(slide, 0, 0, _W, _H, c["bg"])
         _rect(slide, 0, 0, Inches(0.08), _H, c["bar"])
@@ -211,11 +203,9 @@ def create_pptx(data: dict) -> io.BytesIO:
         _para(ttf, title, 26, True, c["title_txt"])
         _rect(slide, Inches(0.22), Inches(0.93), Inches(12.8), Inches(0.035), c["accent"])
 
-
         # ══════════════════════════════════════════════════════════
         # CONTENT SLIDE
         # ══════════════════════════════════════════════════════════
-
 
         # Space allocation
         has_example  = bool(example)
@@ -229,7 +219,6 @@ def create_pptx(data: dict) -> io.BytesIO:
         content_h   = ex_top - content_top - Inches(0.10)
 
         txt_w = Inches(12.8)
-
 
         # ── Points ────────────────────────────────────────────────
         ptf = _tb(slide, Inches(0.22), content_top, txt_w, content_h)

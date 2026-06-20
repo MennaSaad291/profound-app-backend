@@ -1,28 +1,34 @@
 from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 
+
 class UserCreate(BaseModel):
     full_name: str
     email: EmailStr
     password: str
 
+
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+
 
 class UserUpdate(BaseModel):
     full_name: str
     bio: str
     department: str
 
+
 class ChangePasswordRequest(BaseModel):
     user_id: int
     current_password: str
     new_password: str
 
+
 class VerifyPasswordRequest(BaseModel):
     user_id: int
     password: str
+
 
 class PublicationCreate(BaseModel):
     user_id: int
@@ -31,6 +37,7 @@ class PublicationCreate(BaseModel):
     year: int
     citations: int = 0
 
+
 class ProjectCreate(BaseModel):
     user_id: int
     title: str
@@ -38,9 +45,19 @@ class ProjectCreate(BaseModel):
     year: str
     status: str
 
+
 class InterestCreate(BaseModel):
     user_id: int
     name: str
+
+
+class CourseCreate(BaseModel):
+    user_id: int
+    code: str
+    name: str
+    semester: str
+    department: Optional[str] = None
+
 
 class CourseResponse(BaseModel):
     id: int
@@ -52,6 +69,7 @@ class CourseResponse(BaseModel):
     schedule: Optional[str]
     room: Optional[str]
     progress: Optional[int]
+
     class Config:
         from_attributes = True
 
@@ -72,6 +90,7 @@ class ExamRequest(BaseModel):
     blooms_level: str = "Apply"
     question_type: str = "MCQ"
 
+
 class Question(BaseModel):
     question_text: str
     options: Optional[List[str]] = None
@@ -79,6 +98,7 @@ class Question(BaseModel):
     explanation: str
     difficulty: str
     question_type: str = "MCQ"
+
 
 class ExamResponse(BaseModel):
     exam_id: str
@@ -90,26 +110,11 @@ class AssignmentCreate(BaseModel):
     course_id: int
     is_model_answer: bool
     assignment_question: Optional[str] = None
-    assignment_file_path:  Optional[str] = None
-
+    assignment_file_path: Optional[str] = None
     model_answer: Optional[str] = None
     rubric: Optional[str] = None
 
 
-class CourseCreate(BaseModel):
-    user_id: int
-    code: str
-    name: str
-    semester: str
-    department: Optional[str] = None
-
-
-
-class GradeUpdate(BaseModel):
-    ai_grade: int
-    status: str
-class FinalizeRequest(BaseModel):
-    manual_grade: int
 class ReportConfiguration(BaseModel):
     include_pii: bool = True
     include_benchmarks: bool = True
@@ -119,9 +124,10 @@ class ReportConfiguration(BaseModel):
     grade_distribution: bool = True
     export_format: str = "pdf"
 
+
 class AnalysisRequest(BaseModel):
-    course_id: int | None = None
-    semester: str | None = None
-    days: int | None = None 
+    course_id: Optional[int] = None
+    semester: Optional[str] = None
+    days: Optional[int] = None
     from_date: Optional[str] = None
-    to_date: Optional[str] = None  
+    to_date: Optional[str] = None

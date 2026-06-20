@@ -5,11 +5,9 @@ import re
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY_GRADING"))
 
-
 def safe_parse_ai_response(text: str):
     cleaned = re.sub(r"```json|```", "", text).strip()
     return json.loads(cleaned)
-
 
 def perform_nlp_grading(student_text: str, mode: str, reference: str, feedback_tone: str = "formal"):
     """

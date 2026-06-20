@@ -1,15 +1,15 @@
 """
 AI Lecture Generation Service
-- Exact slide count via chunked generation (max 5 slides per AI call)
-- Content depth scales automatically with slide count
+- Exact slide count via sequential chunked generation
+- Sequential calls with retry+backoff to avoid Groq rate limits
+- Content depth scales with slide count
 - Max 70 slides enforced
 - JSON repair for truncated responses
-- Professor manual text and image injections applied per slide
 """
 import os
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from groq import Groq
 from fastapi import HTTPException
 
@@ -17,227 +17,169 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY_LECTURE"))
 
 MAX_SLIDES = 70
 MIN_SLIDES = 3
-
-
+BATCH_SIZE = 3          # slides per API call — small = fewer tokens per call
+MAX_TOKENS = 2500       # tight ceiling — enough for 3 rich slides, avoids waste
+RETRY_DELAYS = [5, 15]  # seconds to wait on rate-limit before retrying (2 attempts)
 
 
 def _depth_instruction(total: int) -> str:
-    """Depth scales with slide count — more slides = more granular content per slide."""
     if total <= 10:
-        return "3 points per slide, each detail 2 sentences"
-    elif total <= 20:
-        return "3-4 points per slide, each detail 2-3 sentences"
-    elif total <= 35:
-        return "4 points per slide, each detail 2-3 sentences, include sub-concepts"
+        return "2-3 points per slide, each 1-2 sentences"
+    elif total <= 25:
+        return "3 points per slide, each 2 sentences"
     else:
-        return "4 points per slide, each detail 3 sentences minimum, deep mechanisms and nuances"
+        return "3 points per slide, each 2 sentences, include key mechanisms"
 
 
 def _make_batches(total: int) -> list:
-    """
-    Split slides into batches of max 5 (smaller = less truncation risk).
-    Returns list of (start, end, role) tuples — 1-indexed.
-    """
-    batches       = []
-    intro_end     = min(3, total)
-    summary_start = max(total - 1, intro_end + 1)
-
-    # Intro batch (slides 1-3)
-    batches.append((1, intro_end, "intro"))
-
-    # Core batches — max 3 per batch to stay well within token limits
-    core_s = intro_end + 1
-    core_e = summary_start - 1
-    i = core_s
-    while i <= core_e:
-        end = min(i + 2, core_e)   # 3 slides per batch — prevents JSON truncation
-        batches.append((i, end, "core"))
+    """Split slides into sequential batches of BATCH_SIZE. Returns list of (start, end, role)."""
+    batches = []
+    i = 1
+    while i <= total:
+        end = min(i + BATCH_SIZE - 1, total)
+        # Assign role based on position
+        if i == 1:
+            role = "intro"
+        elif end == total:
+            role = "outro"
+        else:
+            role = "core"
+        batches.append((i, end, role))
         i = end + 1
-
-    # Outro batch (summary)
-    if summary_start <= total:
-        batches.append((summary_start, total, "outro"))
-
     return batches
 
 
 def _repair_json(raw: str) -> str:
-    """
-    Attempt to salvage truncated JSON by:
-    1. Truncating after the last complete JSON object
-    2. Closing any unclosed arrays/objects
-    """
-    # Find last complete object — ends with }
     last_close = raw.rfind("}")
     if last_close == -1:
         return raw
     raw = raw[:last_close + 1]
-
-    # Balance brackets
-    opens_sq  = raw.count("[") - raw.count("]")
-    opens_cur = raw.count("{") - raw.count("}")
-    raw += "]" * max(0, opens_sq)
-    raw += "}" * max(0, opens_cur)
+    raw += "]" * max(0, raw.count("[") - raw.count("]"))
+    raw += "}" * max(0, raw.count("{") - raw.count("}"))
     return raw
 
 
 def _parse_json_safe(text: str) -> dict:
-    """
-    Try to parse JSON. If it fails (truncated), attempt repair then retry.
-    Raises ValueError if both attempts fail.
-    """
-    # First attempt — clean parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        pass
-
-    # Second attempt — repair then parse
-    repaired = _repair_json(text)
-    return json.loads(repaired)   # raises if still broken
+        return json.loads(_repair_json(text))
 
 
-def _gen_batch(start: int, end: int, role: str, total: int,
-               topic: str, prof_note: str,
-               depth: str) -> list:
+def _build_prompt(start: int, end: int, role: str, total: int,
+                  topic: str, prof_note: str, depth: str) -> str:
     count = end - start + 1
 
     if role == "intro":
         structure = (
-            "Slide 1: Title slide (topic title, brief tagline)\n"
-            "Slide 2: Learning Objectives (5-6 measurable outcomes using Bloom's verbs)\n"
-            "Slide 3: Lecture Overview / Roadmap (list main sections)"
-        )
+            "Slide 1: Title slide (topic title + tagline)\n"
+            "Slide 2: Learning Objectives (4-5 outcomes)\n"
+            "Slide 3: Lecture Overview (list main sections)"
+        ) if total >= 3 else f"Slides 1-{count}: Introduction to {topic}"
     elif role == "outro":
-        structure = (
-            f"Slide {start}: Summary & Key Takeaways — synthesise the most important concepts"
-        )
+        structure = f"Slide {start}: Summary & Key Takeaways — synthesise the most important concepts"
     else:
         structure = (
-            f"Slides {start} to {end}: Core academic content on \"{topic}\".\n"
-            f"Each slide covers a DIFFERENT concept — no overlap between slides.\n"
-            f"This is part of a {total}-slide lecture — maintain logical progression."
+            f"Slides {start}-{end}: Core content on \"{topic}\". "
+            f"Each slide covers a DIFFERENT concept. Part of a {total}-slide lecture."
         )
 
-    # Build a strong professor-instructions block
-    has_custom_instructions = (
-        prof_note
-        and prof_note.strip()
-        and prof_note.strip() != "Produce a thorough, student-friendly academic lecture."
-    )
-    if has_custom_instructions:
-        prof_block = f"""
-⚠️  PROFESSOR INSTRUCTIONS — MANDATORY — APPLY IN EVERY SLIDE:
-{prof_note}
-
-You MUST follow these instructions literally in the slide content:
-- If bilingual output is requested (e.g. Arabic+English), add the translation on every bullet point headline
-- If a teaching style is specified (e.g. Socratic, problem-based), apply it throughout
-- If specific examples, case studies, or topics are named, include them explicitly
-- If formatting or structural preferences are given, honour them
-These override any default behaviour.
-"""
+    has_custom = prof_note and prof_note.strip() and \
+                 prof_note.strip() != "Produce a thorough, student-friendly academic lecture."
+    if has_custom:
+        note_block = f"PROFESSOR INSTRUCTIONS (apply to every slide):\n{prof_note}\n"
     else:
-        prof_block = f"Instructions: {prof_note}"
+        note_block = ""
 
-    prompt = f"""You are a university professor generating lecture slides {start} to {end} (out of {total} total) on "{topic}".
+    # Compact prompt — every line that can be removed is removed
+    return f"""Generate slides {start}-{end} of {total} for a university lecture on "{topic}".
+{note_block}Depth: {depth}
+Structure: {structure}
 
-Depth requirement: {depth}
-{prof_block}
+Return EXACTLY {count} slide objects as JSON:
+{{"slides":[{{"title":"string","points":[{{"headline":"5-7 word headline","detail":"2 sentence explanation"}}],"example":"one concrete example or empty string","image_suggestion":"specific diagram or chart description","speaker_notes":"2-3 sentences"}}]}}
 
-Slide structure for this batch:
-{structure}
+Rules: exactly {count} slides, root key "slides", no markdown, no extra text."""
 
-Return EXACTLY {count} slide objects in this JSON structure:
-{{"slides":[
-  {{
-    "title":"Slide Title Here",
-    "points":[
-      {{"headline":"Bold headline in 5-7 words","detail":"2-3 sentences explaining this in depth with mechanism and significance."}}
-    ],
-    "example":"Concrete real-world example using specific named systems or algorithms. Empty string if not applicable.",
-    "image_suggestion":"Specific visual description for a diagram, chart, or illustration that would enhance this slide (e.g. 'flowchart of TCP three-way handshake', 'bar chart comparing sorting algorithm complexities'). Never null — every slide needs a visual.",
-    "speaker_notes":"3-4 sentences: what to emphasize, questions to ask, connections to make."
-  }}
-]}}
 
-STRICT RULES:
-- Return EXACTLY {count} slides, no more, no less
-- {depth}
-- Root JSON key MUST be "slides"
-- No markdown, no code fences, no text before or after the JSON
-- Keep each point detail concise to avoid response truncation
-- example field must be a plain string
-- image_suggestion must always be a specific, descriptive string — never null or empty"""
+def _gen_batch_with_retry(start: int, end: int, role: str, total: int,
+                          topic: str, prof_note: str, depth: str) -> list:
+    """Call the Groq API for one batch, retrying on rate-limit errors."""
+    prompt = _build_prompt(start, end, role, total, topic, prof_note, depth)
+    count  = end - start + 1
+    last_err = None
 
-    try:
-        c = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Output ONLY valid JSON. No markdown fences. "
-                        "Start your response with { and end with }. "
-                        "Keep responses concise to avoid truncation."
-                    )
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=4000,   # 3 slides per batch — 4000 is plenty
-        )
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Output ONLY valid JSON. No markdown. Start with { end with }."
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=MAX_TOKENS,
+            )
+            raw = resp.choices[0].message.content.strip()
 
-        raw = c.choices[0].message.content.strip()
+            # Strip markdown fences
+            raw = re.sub(r'^```json\s*', '', raw)
+            raw = re.sub(r'^```\s*', '', raw)
+            raw = re.sub(r'\s*```$', '', raw)
+            raw = raw.strip()
 
-        # Strip markdown fences if model adds them
-        raw = re.sub(r'^```json\s*', '', raw)
-        raw = re.sub(r'^```\s*',     '', raw)
-        raw = re.sub(r'\s*```$',     '', raw)
-        raw = raw.strip()
+            # Extract JSON object
+            match = re.search(r'\{', raw)
+            if not match:
+                raise ValueError("No JSON object found")
+            parsed = _parse_json_safe(raw[match.start():])
 
-        # Extract the JSON object
-        match = re.search(r'\{', raw)
-        if not match:
-            raise ValueError("No JSON object found in response")
-        json_str = raw[match.start():]
+            slides_list = parsed.get("slides")
+            if not slides_list:
+                for v in parsed.values():
+                    if isinstance(v, list) and v:
+                        slides_list = v
+                        break
 
-        # Parse with repair fallback
-        parsed = _parse_json_safe(json_str)
+            return _clean_slides(slides_list or [])
 
-        # Normalize root key
-        slides_list = parsed.get("slides")
-        if not slides_list:
-            for v in parsed.values():
-                if isinstance(v, list) and len(v) > 0:
-                    slides_list = v
-                    break
+        except Exception as e:
+            last_err = e
+            err_str  = str(e).lower()
+            is_rate_limit = "rate" in err_str or "429" in err_str or \
+                            "tokens per minute" in err_str or "per minute" in err_str
 
-        return _clean_slides(slides_list or [])
+            if is_rate_limit and attempt < len(RETRY_DELAYS):
+                wait = RETRY_DELAYS[attempt]
+                print(f"[Batch {start}-{end}] Rate limit hit — waiting {wait}s (attempt {attempt+1})")
+                time.sleep(wait)
+                continue
+            else:
+                print(f"[Batch {start}-{end}] Failed after {attempt+1} attempt(s): {e}")
+                break
 
-    except Exception as e:
-        # Return placeholder slides — generation continues for other batches
-        print(f"[Batch {start}-{end}] failed: {e}")
-        return [
-            {
-                "title":            f"Slide {start + i}: {topic}",
-                "points":           [{"headline": "Content unavailable", "detail": "Please regenerate this slide using the refresh button."}],
-                "example":          "",
-                "image_suggestion": None,
-                "speaker_notes":    "",
-            }
-            for i in range(count)
-        ]
+    # Return placeholder slides so generation continues
+    return [
+        {
+            "title":            f"Slide {start + i}: {topic}",
+            "points":           [{"headline": "Content unavailable",
+                                  "detail": "Please regenerate this slide using the refresh button."}],
+            "example":          "",
+            "image_suggestion": None,
+            "speaker_notes":    "",
+        }
+        for i in range(count)
+    ]
 
 
 def _clean_slides(slides_list: list) -> list:
-    """Normalize and validate each slide object."""
     out = []
     for s in slides_list:
         if not isinstance(s, dict):
             continue
-
-        # Normalize points array
         rp = s.get("points", [])
         if isinstance(rp, str):
             rp = [{"headline": rp, "detail": ""}]
@@ -251,12 +193,11 @@ def _clean_slides(slides_list: list) -> list:
             elif isinstance(p, str):
                 pts.append({"headline": p.strip(), "detail": ""})
 
-        # Normalize example
         ex = s.get("example", "")
-        if isinstance(ex, list): ex = " ".join(str(e) for e in ex)
+        if isinstance(ex, list):
+            ex = " ".join(str(e) for e in ex)
         ex = str(ex).strip()
 
-        # Normalize image suggestion
         img = s.get("image_suggestion")
         if img and str(img).lower() in ("null", "none", "n/a", ""):
             img = None
@@ -272,54 +213,37 @@ def _clean_slides(slides_list: list) -> list:
 
 
 def generate_lecture_json(data) -> dict:
-    # ── Enforce slide count limits ────────────────────────────────
     requested = max(MIN_SLIDES, min(int(data.pages_count), MAX_SLIDES))
-
-    topic      = data.topic
+    topic     = data.topic
     additional = getattr(data, "additional_instructions", "") or ""
-    prof_note = additional or "Produce a thorough, student-friendly academic lecture."
-    depth     = _depth_instruction(requested)
+    prof_note  = additional or "Produce a thorough, student-friendly academic lecture."
+    depth      = _depth_instruction(requested)
 
-    # ── Chunked generation (parallel batches) ───────────────────
-    batches = _make_batches(requested)
-    results: dict[int, list] = {}
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        future_map = {
-            pool.submit(_gen_batch, start, end, role, requested, topic, prof_note, depth): idx
-            for idx, (start, end, role) in enumerate(batches)
-        }
-        for future in as_completed(future_map):
-            idx = future_map[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                start, end, _ = batches[idx]
-                count = end - start + 1
-                results[idx] = [
-                    {
-                        "title": f"Slide {start + i}: {topic}",
-                        "points": [{"headline": "Content unavailable", "detail": "Please regenerate this slide."}],
-                        "example": "", "image_suggestion": None, "speaker_notes": "",
-                    }
-                    for i in range(count)
-                ]
-
+    batches    = _make_batches(requested)
     all_slides = []
-    for idx in sorted(results):
-        all_slides.extend(results[idx])
 
-    # ── Trim or pad to exact requested count ──────────────────────
+    # ── Sequential generation with inter-batch pause ──────────────────────────
+    for idx, (start, end, role) in enumerate(batches):
+        # Small pause between calls to stay within tokens-per-minute limit.
+        # Skip pause before first batch.
+        if idx > 0:
+            time.sleep(2)
+
+        slides = _gen_batch_with_retry(start, end, role, requested,
+                                       topic, prof_note, depth)
+        all_slides.extend(slides)
+
+    # ── Trim / pad to exact count ─────────────────────────────────────────────
     all_slides = all_slides[:requested]
     while len(all_slides) < requested:
         all_slides.append({
             "title":            f"Additional Content {len(all_slides) + 1}",
-            "points":           [{"headline": "Additional Content", "detail": f"Additional content on {topic}."}],
+            "points":           [{"headline": "Additional Content",
+                                  "detail":   f"Additional content on {topic}."}],
             "example":          "",
             "image_suggestion": None,
             "speaker_notes":    "",
         })
-
 
     if not all_slides:
         raise HTTPException(status_code=500, detail="Generation failed. Please try again.")

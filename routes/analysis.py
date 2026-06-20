@@ -6,7 +6,6 @@ from services import analytics_service
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
 
-
 #  PERFORMANCE
 @router.get("/performance")
 def performance(
@@ -20,7 +19,6 @@ def performance(
     return analytics_service.get_performance_distribution(
         db, course_id, semester, days, from_date, to_date
     )
-
 
 #  CORRELATION
 @router.get("/correlation")
@@ -36,7 +34,6 @@ def correlation(
         db, course_id, semester, days, from_date, to_date
     )
 
-
 #  PREDICTION
 @router.get("/prediction")
 def prediction(
@@ -51,7 +48,6 @@ def prediction(
         db, course_id, semester, days, from_date, to_date
     )
 
-
 #  ERRORS
 @router.get("/errors")
 def errors(
@@ -65,7 +61,6 @@ def errors(
     return analytics_service.common_error_analysis(
         db, course_id, semester, days, from_date, to_date
     )
-
 
 #  BENCHMARKS
 @router.get("/benchmarks")

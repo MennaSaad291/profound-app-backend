@@ -166,7 +166,6 @@ def get_attendance_correlation_report(
 
     insight_range = f"≈ {lower}–{upper}%"
 
-
     return {
         "stats": {
             "r_squared": round(r_sq, 2),
@@ -215,10 +214,8 @@ def get_prediction(
     if len(weekly_data) < 3:
         return {"chart": [], "message": "Need at least 3 weeks"}
 
-
     X = np.arange(len(weekly_data))
     y = np.array([float(w.avg_grade) for w in weekly_data])
-
 
     if len(weekly_data) >= 8:
         degree = 3
@@ -232,7 +229,6 @@ def get_prediction(
 
     model = LinearRegression()
     model.fit(X_poly, y)
-
 
     future_weeks = 3
     total = len(weekly_data) + future_weeks
@@ -367,7 +363,6 @@ def common_error_analysis(db, course_id=None, semester=None, days=None, from_dat
 
     return result
 
-
 def get_student_insights(db, course_id, semester=None, days=None, from_date=None, to_date=None):
 
     query = db.query(
@@ -490,7 +485,6 @@ def department_benchmarks(
         )
 
     your_assignment_completion = (submitted * 100.0) / total_assign
-
 
     assign_dept = db.query(AssignmentDB).join(CourseDB)
 
