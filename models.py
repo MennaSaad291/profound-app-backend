@@ -112,6 +112,8 @@ class QuestionDB(Base):
 class SubmissionDB(Base):
     __tablename__ = "submissions"
     id = Column(Integer, primary_key=True, index=True)
+    #TO LINK SUBMISSIONS TO A PROFESSOR/USER ───
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     assignment_id = Column(Integer, ForeignKey("assignments.id", ondelete="CASCADE"))
     student_name = Column(String)
     submission_time = Column(DateTime, default=datetime.datetime.utcnow)

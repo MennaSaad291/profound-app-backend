@@ -6,6 +6,7 @@ import re
 import uuid
 import shutil
 import pandas as pd
+from difflib import SequenceMatcher
 from typing import List, Optional
 from datetime import datetime
 from dotenv import load_dotenv
@@ -596,38 +597,142 @@ async def export_pptx_alias(data: dict):
 
 
 # ── Assignments ───────────────────────────────────────────────────────────────
+# ── Text Processing Utilities for Plagiarism ────────────────────────────
+
+def clean_text(text: str) -> str:
+    """Clean text for comparison"""
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def calculate_similarity(text1: str, text2: str) -> float:
+    """Calculate similarity between two texts"""
+    t1 = clean_text(text1)
+    t2 = clean_text(text2)
+
+    if not t1 or not t2:
+        return 0.0
+
+    return SequenceMatcher(None, t1, t2).ratio() * 100
+
+
+async def check_plagiarism_ai_direct(student_text: str, user_id: int, db: Session):
+    """
+    Check plagiarism against PRIVATE submissions belonging to the specific user only
+    """
+    if not student_text:
+        return {
+            "plagiarism_score": 0,
+            "matches": [],
+            "message": "No student text provided"
+        }
+
+    existing_submissions = db.query(SubmissionDB).filter(SubmissionDB.user_id == user_id).all()
+    if not existing_submissions:
+        return {
+            "plagiarism_score": 0,
+            "matches": [],
+            "message": "No existing submissions to check against"
+        }
+
+    matches = []
+    highest_match = 0
+    total_similarity = 0
+    count = 0
+
+    for sub in existing_submissions:
+        if sub.essay_content and sub.id:
+            similarity = calculate_similarity(student_text, sub.essay_content)
+
+            if similarity > 15:
+                matches.append({
+                    "student_name": sub.student_name,
+                    "similarity": similarity,
+                    "submission_id": sub.id,
+                    "content_preview": sub.essay_content[:200] + "..." if len(
+                        sub.essay_content) > 200 else sub.essay_content,
+                    "grade": sub.ai_grade
+                })
+
+                if similarity > highest_match:
+                    highest_match = similarity
+
+                total_similarity += similarity
+                count += 1
+
+    avg_similarity = total_similarity / count if count > 0 else 0
+
+    if highest_match > 0:
+        plagiarism_score = int((highest_match * 0.6) + (avg_similarity * 0.4))
+        plagiarism_score = min(100, plagiarism_score)
+    else:
+        plagiarism_score = 0
+
+    print(
+        f"🔍 Plagiarism check (isolated): Found {len(matches)} user-specific matches, highest: {highest_match}%, avg: {avg_similarity}%, score: {plagiarism_score}%")
+    return {
+        "plagiarism_score": plagiarism_score,
+        "highest_match": highest_match,
+        "average_match": avg_similarity,
+        "matches": sorted(matches, key=lambda x: x['similarity'], reverse=True),
+        "total_checked": len(existing_submissions),
+        "total_matches": len(matches),
+        "message": f"Found {len(matches)} similar submissions out of {len(existing_submissions)} checked."
+    }
+
+
+# ── Submission & Assignment Routing ─────────────────────────────────────
+
+@app.get("/submissions")
+async def get_submissions(assignment_id: int, db: Session = Depends(get_db)):
+    """Fetches submissions sorted by the latest record first."""
+    return db.query(SubmissionDB).filter(
+        SubmissionDB.assignment_id == assignment_id
+    ).order_by(SubmissionDB.id.desc()).all()
+
 
 @app.post("/assignments")
 async def create_assignment(
-    assignment_name: str = Form(...),
-    course_id: int = Form(...),
-    assignment_question: Optional[str] = Form(None),
-    assignment_file: Optional[UploadFile] = File(None),
-    is_model_answer: bool = Form(...),
-    model_answer: Optional[str] = Form(None),
-    rubric: Optional[str] = Form(None),
-    db: Session = Depends(get_db)
+        assignment_name: str = Form(...),
+        course_id: int = Form(...),
+        assignment_question: Optional[str] = Form(None),
+        assignment_file: Optional[UploadFile] = File(None),
+        is_model_answer: bool = Form(...),
+        model_answer: Optional[str] = Form(None),
+        rubric: Optional[str] = Form(None),
+        db: Session = Depends(get_db)
 ):
-    file_path = None
-    if assignment_file:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = f"{course_id}_{timestamp}_{assignment_file.filename}".replace(" ", "_")
-        file_path = os.path.join(UPLOAD_DIR, safe_name)
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(assignment_file.file, f)
+    file_local_path = None
 
-    if not db.query(CourseDB).filter(CourseDB.id == course_id).first():
+    if assignment_file:
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_name = f"{course_id}_{timestamp}_{assignment_file.filename}".replace(" ", "_")
+            file_local_path = os.path.join(UPLOAD_DIR, safe_name)
+
+            with open(file_local_path, "wb") as buffer:
+                shutil.copyfileobj(assignment_file.file, buffer)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"File save error: {str(e)}")
+
+    course = db.query(CourseDB).filter(CourseDB.id == course_id).first()
+    if not course:
         raise HTTPException(status_code=400, detail="Course not found")
 
     new_assignment = AssignmentDB(
         assignment_name=assignment_name,
         course_id=course_id,
         assignment_question=assignment_question,
-        assignment_file_path=file_path,
+        assignment_file_path=file_local_path,
         model_answer=model_answer,
         rubric=rubric,
         is_model_answer=is_model_answer
     )
+
     db.add(new_assignment)
     db.commit()
     db.refresh(new_assignment)
@@ -637,45 +742,37 @@ async def create_assignment(
 @app.get("/assignments-with-submissions/{course_id}")
 async def get_nested_assignments(course_id: int, db: Session = Depends(get_db)):
     assignments = db.query(AssignmentDB).filter(AssignmentDB.course_id == course_id).all()
-    return [
-        {
-            "id": a.id,
-            "assignment_name": a.assignment_name,
-            "model_answer": a.model_answer,
-            "rubric": a.rubric,
-            "is_model_answer": a.is_model_answer,
+    result = []
+    for assign in assignments:
+        subs = db.query(SubmissionDB).filter(SubmissionDB.assignment_id == assign.id).all()
+        result.append({
+            "id": assign.id,
+            "assignment_name": assign.assignment_name,
+            "model_answer": assign.model_answer,
+            "rubric": assign.rubric,
+            "is_model_answer": assign.is_model_answer,
             "submissions": [
                 {
                     "id": s.id,
                     "student_name": s.student_name,
-                    "status": s.status,
                     "ai_grade": s.ai_grade,
-                    "manual_grade": s.manual_grade,
-                    "final_grade": s.manual_grade if s.manual_grade is not None else s.ai_grade,
+                    "plagiarism_score": s.plagiarism_score,
+                    "status": s.status,
                     "grade_report": s.grade_report,
-                }
-                for s in db.query(SubmissionDB).filter(SubmissionDB.assignment_id == a.id).all()
+                    "essay_content": s.essay_content,
+                    "submitted_at": s.submission_time.isoformat() if s.submission_time else None
+                } for s in subs
             ]
-        }
-        for a in assignments
-    ]
+        })
+    return result
 
-
-@app.get("/submissions")
-async def get_submissions(assignment_id: int, db: Session = Depends(get_db)):
-    return db.query(SubmissionDB).filter(
-        SubmissionDB.assignment_id == assignment_id
-    ).order_by(SubmissionDB.id.desc()).all()
-
-
-# ── Grading ───────────────────────────────────────────────────────────────────
 
 @app.post("/grade-submission/{assignment_id}")
 async def grade_student(
-    assignment_id: int,
-    file: UploadFile = File(...),
-    feedback_tone: Optional[str] = Form("formal"),
-    db: Session = Depends(get_db)
+        assignment_id: int,
+        file: UploadFile = File(...),
+        feedback_tone: Optional[str] = Form("formal"),
+        db: Session = Depends(get_db)
 ):
     assign = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
     if not assign:
@@ -689,9 +786,10 @@ async def grade_student(
     temp_path = f"temp_{uuid.uuid4()}.{ext}"
     with open(temp_path, "wb") as f:
         f.write(content)
-
+    student_text = ""
     try:
         if ext == "docx":
+            from docx import Document
             student_text = "\n".join(p.text for p in Document(temp_path).paragraphs)
         elif ext == "pdf":
             student_text = extract_text(temp_path)
@@ -708,22 +806,42 @@ async def grade_student(
         mode = "RUBRIC"
         reference = f"### MODE: RUBRIC\nQUESTION:\n{assign.assignment_question}\n\nRUBRIC:\n{assign.rubric}"
 
+    # Evaluate using NLP module
     ai_report = perform_nlp_grading(
-        student_text=student_text, mode=mode,
-        reference=reference, feedback_tone=feedback_tone,
+        student_text=student_text,
+        mode=mode,
+        reference=reference,
+        feedback_tone=feedback_tone,
     )
+
+    course = db.query(CourseDB).filter(CourseDB.id == assign.course_id).first()
+    owner_id = course.user_id if course else 1
+
+    plagiarism_result = await check_plagiarism_ai_direct(
+        student_text=student_text,
+        user_id=owner_id,
+        db=db
+    )
+    plagiarism_score = plagiarism_result.get("plagiarism_score", 0)
+    plagiarism_matches = plagiarism_result.get("matches", [])
+
+    ai_report["plagiarism"] = plagiarism_score
+    ai_report["plagiarism_matches"] = plagiarism_matches
 
     new_sub = SubmissionDB(
         assignment_id=assignment_id,
         student_name=file.filename.split('.')[0],
         status="ready",
         ai_grade=ai_report.get('score_out_of_100', 0),
+        plagiarism_score=plagiarism_score,
         grade_report=ai_report,
         essay_content=student_text,
     )
     db.add(new_sub)
     db.flush()
+    db.refresh(new_sub)
 
+    # Track structural errors for reporting profiles
     category_label_map = {
         "conceptual": "Conceptual", "structural": "Structural",
         "language": "Language", "completeness": "Completeness",
@@ -751,38 +869,92 @@ async def grade_student(
         "mode": mode,
         "feedback_tone": feedback_tone,
         "report": ai_report,
+        "essay_content": student_text,
+        "plagiarism_score": plagiarism_score,
+        "plagiarism_matches": plagiarism_matches
     }
 
 
-@app.post("/api/grade-essay/{submission_id}")
-async def grade_essay(submission_id: int, db: Session = Depends(get_db)):
-    submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
-    if not submission:
-        raise HTTPException(status_code=404, detail="Submission not found")
-    prompt = f"""
-    Act as a professor. Grade this essay 0-100.
-    Return ONLY JSON with keys "score" (int) and "feedback" (string).
-    Essay: {submission.essay_content}
-    """
-    try:
-        result = json.loads(groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        ).choices[0].message.content)
-        submission.ai_grade = result.get("score")
-        submission.status = "ready"
-        db.commit()
-        return {"status": "success", "grade": submission.ai_grade}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/analyze-general-submission")
+async def analyze_general(data: dict, user_id: int, db: Session = Depends(get_db)):
+    student_text = data.get("student_text")
+    mode = data.get("mode")
+    reference = data.get("reference_content")
+    feedback_tone = data.get("feedback_tone", "formal")
 
+    if not all([student_text, mode, reference]):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    try:
+        report = perform_nlp_grading(
+            student_text=student_text,
+            mode=mode,
+            reference=reference,
+            feedback_tone=feedback_tone
+        )
+        try:
+            plagiarism_result = await check_plagiarism_ai_direct(
+                student_text=student_text,
+                user_id=user_id,
+                db=db
+            )
+            report["plagiarism"] = plagiarism_result.get("plagiarism_score", 0)
+            report["plagiarism_matches"] = plagiarism_result.get("matches", [])
+            print(f" Plagiarism added to response: {report['plagiarism']}%")
+        except Exception as e:
+            print(f"Plagiarism check error: {e}")
+
+        return report
+    except Exception as e:
+        print(f"AI Service Error: {e}")
+        raise HTTPException(status_code=500, detail=f"AI grading failed: {str(e)}")
+
+
+@app.post("/submissions/general")
+async def create_general_submission(data: dict, db: Session = Depends(get_db)):
+    grade_report = data.get("grade_report", {})
+
+    new_sub = SubmissionDB(
+        student_name=data.get("student_name", "Unknown"),
+        essay_content=data.get("essay_content"),
+        ai_grade=data.get("ai_grade"),
+        plagiarism_score=data.get("plagiarism_score", 0),
+        grade_report=grade_report,
+        status=data.get("status", "ready"),
+        assignment_id=None,
+        user_id=data.get("user_id")
+    )
+    db.add(new_sub)
+    db.commit()
+    db.refresh(new_sub)
+    return {
+        "id": new_sub.id,
+        "student_name": new_sub.student_name,
+        "ai_grade": new_sub.ai_grade,
+        "plagiarism_score": new_sub.plagiarism_score,
+        "status": new_sub.status,
+        "essay_content": new_sub.essay_content,
+        "grade_report": new_sub.grade_report,
+        "submission_time": new_sub.submission_time.isoformat() if new_sub.submission_time else None
+    }
+
+
+@app.get("/submissions/general")
+async def get_general_submissions(user_id: int, db: Session = Depends(get_db)):
+    return db.query(SubmissionDB).filter(
+        SubmissionDB.assignment_id == None,
+        SubmissionDB.user_id == user_id
+    ).order_by(SubmissionDB.id.desc()).all()
+
+
+# ── Grade Adjustment & Management Core ──────────────────────────────────
 
 @app.put("/api/submissions/{submission_id}")
-def update_submission_grade(submission_id: int, data: GradeUpdate, db: Session = Depends(get_db)):
+def update_submission_grade_api(submission_id: int, data: GradeUpdate, db: Session = Depends(get_db)):
     submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
+
     submission.ai_grade = data.ai_grade
     submission.status = data.status
     db.commit()
@@ -794,10 +966,23 @@ async def update_grade(submission_id: int, data: dict, db: Session = Depends(get
     submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
-    submission.manual_grade = int(data['final_grade'])
-    submission.status = "graded"
+
+    # Clean parameter fallbacks to parse final structural assignments safely
+    submission.manual_grade = int(data.get('final_grade', data.get('ai_grade', 0)))
+    submission.status = data.get('status', 'graded')
+
     db.commit()
-    return {"message": "Success"}
+    db.refresh(submission)
+    return {
+        "id": submission.id,
+        "student_name": submission.student_name,
+        "ai_grade": submission.ai_grade,
+        "plagiarism_score": submission.plagiarism_score,
+        "status": submission.status,
+        "essay_content": submission.essay_content,
+        "grade_report": submission.grade_report,
+        "submitted_at": submission.submission_time.isoformat() if submission.submission_time else None
+    }
 
 
 @app.post("/submissions/{submission_id}/finalize")
@@ -805,29 +990,37 @@ async def finalize_submission(submission_id: int, data: FinalizeRequest, db: Ses
     submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
+
     submission.ai_grade = data.manual_grade
     submission.status = "graded"
     db.commit()
     db.refresh(submission)
-    return {"status": "success", "message": "Grade finalized", "final_grade": submission.ai_grade}
+    return {
+        "status": "success",
+        "message": "Grade finalized",
+        "final_grade": submission.ai_grade
+    }
 
 
-@app.post("/analyze-general-submission")
-async def analyze_general(data: dict):
-    student_text = data.get("student_text")
-    mode = data.get("mode")
-    reference = data.get("reference_content")
-    feedback_tone = data.get("feedback_tone", "formal")
-    if not all([student_text, mode, reference]):
-        raise HTTPException(status_code=400, detail="Missing required fields")
-    try:
-        return perform_nlp_grading(
-            student_text=student_text, mode=mode,
-            reference=reference, feedback_tone=feedback_tone
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="AI grading failed")
+@app.get("/submission-details/{submission_id}")
+async def get_submission_details(submission_id: int, db: Session = Depends(get_db)):
+    submission = db.query(SubmissionDB).filter(SubmissionDB.id == submission_id).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
 
+    return {
+        "id": submission.id,
+        "student_name": submission.student_name,
+        "ai_grade": submission.ai_grade,
+        "plagiarism_score": submission.plagiarism_score,
+        "status": submission.status,
+        "essay_content": submission.essay_content,
+        "submitted_at": submission.submission_time.isoformat() if submission.submission_time else None,
+        "grade_report": submission.grade_report or {
+            "summary": "Analysis complete.",
+            "detected_language": "English"
+        }
+    }
 
 # ── Performance Upload ────────────────────────────────────────────────────────
 
