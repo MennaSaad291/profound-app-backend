@@ -416,15 +416,25 @@ def get_courses(user_id: int, db: Session = Depends(get_db)):
 
 @app.get("/dashboard-stats/{user_id}")
 def get_dashboard_stats(user_id: int, db: Session = Depends(get_db)):
+    # Count all courses (all statuses — professors want to see their full picture)
     courses = db.query(CourseDB).filter(CourseDB.user_id == user_id).all()
     course_ids = [c.id for c in courses]
+    active_course_ids = [c.id for c in courses if (c.status or '').lower() == 'active']
 
     if not course_ids:
         return {
             "class_average": 0.0, "average_trend": 0.0,
             "at_risk_count": 0, "pending_grading": 0,
             "total_students": 0, "total_courses": 0,
+            "active_courses": 0,
         }
+
+    # Total unique students enrolled across all courses (live count, not cached column)
+    total_students = (
+        db.query(func.count(StudentDB.id))
+        .filter(StudentDB.course_id.in_(course_ids))
+        .scalar() or 0
+    )
 
     graded_subs = (
         db.query(SubmissionDB)
@@ -455,19 +465,14 @@ def get_dashboard_stats(user_id: int, db: Session = Depends(get_db)):
         ).count()
     )
 
-    total_students = (
-        db.query(func.count(StudentDB.id))
-        .filter(StudentDB.course_id.in_(course_ids))
-        .scalar()
-    )
-
     return {
-        "class_average": class_average,
-        "average_trend": 0.0,
-        "at_risk_count": at_risk_count,
+        "class_average":  class_average,
+        "average_trend":  0.0,
+        "at_risk_count":  at_risk_count,
         "pending_grading": pending_grading,
         "total_students": total_students,
-        "total_courses": len(courses),
+        "total_courses":  len(courses),
+        "active_courses": len(active_course_ids),
     }
 
 

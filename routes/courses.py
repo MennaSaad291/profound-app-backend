@@ -109,7 +109,8 @@ def add_student(course_id: int, data: StudentCreate, db: Session = Depends(get_d
     student = StudentDB(student_id=data.student_id, name=data.name,
                         department=data.department or "", course_id=course_id)
     db.add(student)
-    course.students = db.query(func.count(StudentDB.id)).filter(StudentDB.course_id == course_id).scalar() + 1
+    db.flush()  # make new row visible to COUNT
+    course.students = db.query(func.count(StudentDB.id)).filter(StudentDB.course_id == course_id).scalar()
     db.commit()
     db.refresh(student)
     return {"message": "Student added", "id": student.id}
@@ -218,7 +219,8 @@ async def upload_students_excel(course_id: int, file: UploadFile = File(...), db
 
     if to_add:
         db.bulk_save_objects(to_add)
-    course.students = db.query(func.count(StudentDB.id)).filter(StudentDB.course_id == course_id).scalar() + len(to_add)
+        db.flush()  # ensure new rows are visible to the COUNT query below
+    course.students = db.query(func.count(StudentDB.id)).filter(StudentDB.course_id == course_id).scalar()
     db.commit()
     return {"message": f"Added {len(to_add)} student(s). Skipped {skipped} duplicate(s)."}
 
