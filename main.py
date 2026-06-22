@@ -471,28 +471,46 @@ def get_dashboard_stats(user_id: int, db: Session = Depends(get_db)):
     }
 
 
-# ── Exam Generation ───────────────────────────────────────────────────────────
+# ── Bloom's taxonomy definitions used in every prompt ────────────────────────
+BLOOMS_DEFINITIONS = {
+    "Remember":   "RECALL facts, terms, definitions, dates. Questions must ask students to RECITE or IDENTIFY information directly stated in the material. Use verbs: define, list, name, recall, state, identify.",
+    "Understand": "EXPLAIN concepts in their own words, SUMMARIZE ideas, INTERPRET meaning, CLASSIFY examples. Questions must ask students to DESCRIBE, EXPLAIN, or PARAPHRASE — not just recall. Use verbs: explain, summarise, classify, describe, interpret, compare.",
+    "Apply":      "USE knowledge to SOLVE problems in NEW situations. Questions must present a SCENARIO or problem the student must solve by applying a rule, formula, or concept. Use verbs: solve, demonstrate, use, calculate, apply, show how.",
+    "Analyze":    "BREAK DOWN information into parts, find PATTERNS, CAUSES, or RELATIONSHIPS. Questions must ask students to EXAMINE, COMPARE, CONTRAST, or DISTINGUISH components. Use verbs: analyse, compare, contrast, differentiate, examine, break down.",
+    "Evaluate":   "JUDGE the value of information using CRITERIA, DEFEND a position, CRITIQUE a solution. Questions must ask students to ASSESS, ARGUE, JUSTIFY, or CRITIQUE with reasons. Use verbs: evaluate, justify, assess, critique, defend, recommend, judge.",
+    "Create":     "DESIGN or PRODUCE something NEW by combining ideas. Questions must ask students to CONSTRUCT, DESIGN, PROPOSE, or PLAN something original. Use verbs: design, create, construct, propose, develop, formulate, plan.",
+}
+
 
 @app.post("/exams/generate", response_model=ExamResponse)
 async def generate_exam(request: ExamRequest, db: Session = Depends(get_db)):
-    prompt = f"""
-    Act as a University Professor. Generate EXACTLY {request.number_of_questions} {request.question_type} questions for: {request.topic}.
-    Bloom's Taxonomy: {request.blooms_level}. Difficulty: {request.difficulty}.
+    blooms_def = BLOOMS_DEFINITIONS.get(request.blooms_level, "")
 
-    RULES:
-    - Generate EXACTLY {request.number_of_questions} questions.
-    - question_type for every question MUST be "{request.question_type}"
-    - MCQ: options must be a list of exactly 4 strings. correct_answer must be the FULL TEXT of the correct option.
-    - Essay: options must be null. correct_answer must be a model answer string, never null.
+    prompt = f"""You are a university professor generating EXACTLY {request.number_of_questions} {request.question_type} exam questions.
+Topic: {request.topic}
+Difficulty: {request.difficulty}
 
-    Return ONLY JSON with key "questions" containing exactly {request.number_of_questions} objects:
-    "question_text", "question_type", "options", "correct_answer", "explanation", "difficulty"
-    """
+BLOOM'S TAXONOMY LEVEL — {request.blooms_level.upper()}:
+{blooms_def}
+
+CRITICAL: Every question MUST operate at the {request.blooms_level} cognitive level as described above.
+Questions at the WRONG level will be rejected. Do not generate lower-level questions.
+
+QUESTION TYPE RULES:
+- question_type for every question MUST be "{request.question_type}"
+- MCQ: options must be a list of exactly 4 strings. correct_answer must be the FULL TEXT of the correct option.
+- Essay: options must be null. correct_answer must be a detailed model answer string.
+
+Return ONLY JSON with key "questions" containing exactly {request.number_of_questions} objects:
+"question_text", "question_type", "options", "correct_answer", "explanation", "difficulty"
+
+The explanation field must describe WHY this question tests {request.blooms_level}-level thinking."""
+
     try:
         completion = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a JSON-only academic exam generator."},
+                {"role": "system", "content": "You are a JSON-only academic exam generator. Strictly follow Bloom's taxonomy level instructions."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"}
@@ -567,6 +585,202 @@ async def export_exam_word(exam_id: str, db: Session = Depends(get_db)):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f"attachment; filename=Exam_{exam_id}.docx"}
     )
+
+
+@app.post("/exams/{exam_id}/variations")
+async def generate_exam_variations(
+    exam_id: str,
+    data: dict,
+    db: Session = Depends(get_db)
+):
+    """
+    Generate N shuffled variations to minimise cheating.
+    Each version has a different question order AND different MCQ option order.
+    Each version is seeded differently so they are truly distinct.
+    """
+    import random, zipfile
+    from copy import deepcopy
+
+    num_variations = max(2, min(int(data.get("num_variations", 3)), 10))
+
+    exam = db.query(ExamDB).filter(ExamDB.id == exam_id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    questions = db.query(QuestionDB).filter(QuestionDB.exam_id == exam_id).all()
+    if not questions:
+        raise HTTPException(status_code=404, detail="No questions found for this exam")
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for v in range(1, num_variations + 1):
+            # Different seed per version guarantees distinct shuffles
+            rng = random.Random(v * 997 + len(questions) * 31)
+            qs = deepcopy(questions)
+            rng.shuffle(qs)
+
+            doc = Document()
+            doc.add_heading(f"{exam.title} — Version {v}", 0)
+            doc.add_paragraph(f"Date: {datetime.now().strftime('%Y-%m-%d')}  |  Version {v} of {num_variations}")
+            doc.add_paragraph(f"Total Questions: {len(qs)}")
+            doc.add_paragraph("Student Name: ____________________________   ID: ____________")
+            doc.add_paragraph("")
+
+            answer_key = []
+            labels = ["A", "B", "C", "D"]
+
+            for i, q in enumerate(qs, 1):
+                p = doc.add_paragraph()
+                p.add_run(f"Q{i}. [{q.difficulty} | {getattr(q, 'blooms_level', '')}]  {q.question_text}").bold = True
+
+                if q.question_type == "MCQ" and q.options:
+                    opts = list(q.options)
+                    correct_text = q.correct_answer
+                    rng.shuffle(opts)   # unique shuffle per version
+                    correct_label = "?"
+                    for j, opt in enumerate(opts):
+                        lbl = labels[j] if j < len(labels) else str(j + 1)
+                        doc.add_paragraph(f"   {lbl}. {opt}")
+                        if opt == correct_text:
+                            correct_label = lbl
+                    answer_key.append(f"Q{i}: {correct_label}")
+                else:
+                    doc.add_paragraph("Answer: _______________________________________________")
+                    answer_key.append(f"Q{i}: {(q.correct_answer or '')[:100]}")
+
+                doc.add_paragraph("")
+
+            doc.add_page_break()
+            doc.add_heading(f"ANSWER KEY — Version {v}  (Professor Copy — Do Not Distribute)", level=1)
+            for ak in answer_key:
+                doc.add_paragraph(ak)
+
+            buf = io.BytesIO()
+            doc.save(buf)
+            buf.seek(0)
+            zf.writestr(f"Exam_Version_{v:02d}.docx", buf.read())
+
+    zip_buffer.seek(0)
+    topic_clean = exam.title.replace(" ", "_")[:40]
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={topic_clean}_Variations.zip"}
+    )
+
+
+@app.post("/exams/generate-from-content")
+async def generate_exam_from_content(
+    topic: str = Form(...),
+    number_of_questions: int = Form(5),
+    difficulty: str = Form("Medium"),
+    blooms_level: str = Form("Apply"),
+    question_type: str = Form("MCQ"),
+    mcq_percentage: int = Form(70),
+    existing_exam_id: str = Form(None),     # if set, append questions to this exam
+    content_file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Generate exam from uploaded content. Supports Mix, all Bloom's levels, and multi-batch."""
+    content = await content_file.read()
+    ext = content_file.filename.lower().split(".")[-1]
+    temp_path = f"temp_exam_{uuid.uuid4()}.{ext}"
+    with open(temp_path, "wb") as f:
+        f.write(content)
+    try:
+        extracted = extract_text(temp_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    content_excerpt = extracted[:3000] if len(extracted) > 3000 else extracted
+    blooms_def = BLOOMS_DEFINITIONS.get(blooms_level, "")
+
+    # Reuse existing exam or create new one
+    if existing_exam_id:
+        exam_id = existing_exam_id
+        if not db.query(ExamDB).filter(ExamDB.id == exam_id).first():
+            db.add(ExamDB(id=exam_id, title=f"Assessment: {topic}"))
+    else:
+        exam_id = str(uuid.uuid4())[:8]
+        db.add(ExamDB(id=exam_id, title=f"Assessment: {topic}"))
+
+    all_questions = []
+
+    # Resolve Mix distribution
+    if question_type == "Mix":
+        mcq_count   = max(1, round(number_of_questions * mcq_percentage / 100))
+        essay_count = max(1, number_of_questions - mcq_count)
+        type_batches = [("MCQ", mcq_count), ("Essay", essay_count)]
+    else:
+        type_batches = [(question_type, number_of_questions)]
+
+    for q_type, q_count in type_batches:
+        if q_count == 0:
+            continue
+        prompt = f"""You are a university professor generating EXACTLY {q_count} {q_type} exam questions
+based on the following lecture material about "{topic}".
+Difficulty: {difficulty}
+
+BLOOM'S TAXONOMY LEVEL — {blooms_level.upper()}:
+{blooms_def}
+
+CRITICAL: Every question MUST operate at the {blooms_level} cognitive level. Do not generate lower-level questions.
+
+Lecture Material:
+{content_excerpt}
+
+RULES:
+- Generate EXACTLY {q_count} questions derived from the provided material.
+- question_type for every question MUST be "{q_type}"
+- MCQ: options must be a list of exactly 4 strings. correct_answer must be the FULL TEXT of the correct option.
+- Essay: options must be null. correct_answer must be a detailed model answer.
+
+Return ONLY JSON with key "questions":
+"question_text", "question_type", "options", "correct_answer", "explanation", "difficulty"
+"""
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a JSON-only academic exam generator. Strictly follow Bloom's taxonomy instructions."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+        batch = json.loads(completion.choices[0].message.content).get("questions", [])[:q_count]
+
+        for q in batch:
+            q_options = q.get("options")
+            raw_answer = q.get("correct_answer") or q.get("answer")
+            if isinstance(raw_answer, int) and q_options and 0 <= raw_answer < len(q_options):
+                q_answer = str(q_options[raw_answer])
+            elif isinstance(raw_answer, str) and len(raw_answer) == 1 and raw_answer.upper() in "ABCD" and q_options:
+                idx = ord(raw_answer.upper()) - ord('A')
+                q_answer = str(q_options[idx]) if 0 <= idx < len(q_options) else raw_answer
+            else:
+                q_answer = str(raw_answer) if raw_answer is not None else ""
+
+            q_text = q.get("question_text") or q.get("question")
+            q_diff = q.get("difficulty") or difficulty
+
+            db.add(QuestionDB(
+                id=str(uuid.uuid4())[:8], exam_id=exam_id, question_text=q_text,
+                question_type=q_type, options=q_options, blooms_level=blooms_level,
+                difficulty=q_diff, correct_answer=q_answer,
+                explanation=q.get("explanation", "")
+            ))
+            all_questions.append(Question(
+                question_text=q_text, options=q_options, correct_answer=q_answer,
+                explanation=q.get("explanation", ""), difficulty=q_diff, question_type=q_type
+            ))
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"exam_id": exam_id, "questions": all_questions}
 
 
 # ── Lecture / PPTX ───────────────────────────────────────────────────────────
