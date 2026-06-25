@@ -523,8 +523,13 @@ The explanation field must describe WHY this question tests {request.blooms_leve
         ai_data = json.loads(completion.choices[0].message.content)
         all_questions = ai_data.get("questions", [])[:request.number_of_questions]
 
-        exam_id = str(uuid.uuid4())[:8]
-        db.add(ExamDB(id=exam_id, course_id=request.course_id, title=f"Assessment: {request.topic}"))
+        # Reuse an existing exam if provided (so all batches share one exam_id)
+        existing_id = getattr(request, "existing_exam_id", None)
+        if existing_id and db.query(ExamDB).filter(ExamDB.id == existing_id).first():
+            exam_id = existing_id
+        else:
+            exam_id = str(uuid.uuid4())[:8]
+            db.add(ExamDB(id=exam_id, course_id=request.course_id, title=f"Assessment: {request.topic}"))
 
         generated_questions = []
         for q in all_questions:

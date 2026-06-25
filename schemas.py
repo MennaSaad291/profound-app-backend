@@ -89,6 +89,7 @@ class ExamRequest(BaseModel):
     difficulty: str = "Medium"
     blooms_level: str = "Apply"
     question_type: str = "MCQ"
+    existing_exam_id: Optional[str] = None   # append questions to this exam instead of creating new
 
 
 class Question(BaseModel):
