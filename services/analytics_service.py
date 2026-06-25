@@ -1211,21 +1211,31 @@ def export_report(
                 )
 
             if "errors" in data and data["errors"]:
-
+                # New shape: category / total_errors / percentage /
+                #            affected_students / notes[{description, assignment}]
                 error_rows = []
-
                 for category in data["errors"]:
-
-                    for pattern in category.get("patterns", []):
-
+                    notes = category.get("notes", [])
+                    if notes:
+                        for note in notes:
+                            error_rows.append({
+                                "Category":          category.get("category", "-"),
+                                "Affected Students": category.get("affected_students", 0),
+                                "% of Errors":       category.get("percentage", 0),
+                                "Assignment":        note.get("assignment", "-"),
+                                "Description":       note.get("description", "-"),
+                            })
+                    else:
+                        # category has no notes yet — still include the summary row
                         error_rows.append({
-                            "Category": category.get("category", "-"),
-                            "Type": pattern.get("error_type", "-"),
-                            "Occurrences": pattern.get("occurrences", 0),
+                            "Category":          category.get("category", "-"),
+                            "Affected Students": category.get("affected_students", 0),
+                            "% of Errors":       category.get("percentage", 0),
+                            "Assignment":        "-",
+                            "Description":       "-",
                         })
 
-                if len(error_rows) > 0:
-
+                if error_rows:
                     pd.DataFrame(error_rows).to_excel(
                         writer,
                         sheet_name="Errors",
@@ -1271,92 +1281,6 @@ def export_report(
                 "Content-Disposition": "attachment; filename=analytics_report.xlsx"
             }
         )
-
-    # =====================================================
-    # EXCEL EXPORT
-    # =====================================================
-
-    elif config.export_format == "excel":
-
-        buffer = io.BytesIO()
-
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-
-            if "students" in data:
-
-                students_rows = [
-                    {
-                        "Student ID": s["id"],
-                        "Name": s["name"],
-                        "Department": s["department"]
-                    }
-                    for s in data["students"]["students"]
-                ]
-
-                pd.DataFrame(students_rows).to_excel(
-                    writer,
-                    sheet_name="Students",
-                    index=False
-                )
-
-            if "benchmarks" in data:
-
-                pd.DataFrame(data["benchmarks"]).to_excel(
-                    writer,
-                    sheet_name="Benchmarks",
-                    index=False
-                )
-
-            if "errors" in data and data["errors"]:
-
-                error_rows = []
-
-                for category in data["errors"]:
-
-                    for pattern in category.get("patterns", []):
-
-                        error_rows.append({
-                            "Category": category.get("category", "-"),
-                            "Type": pattern.get("error_type", "-"),
-                            "Occurrences": pattern.get("occurrences", 0),
-                        })
-
-                pd.DataFrame(error_rows).to_excel(
-                    writer,
-                    sheet_name="Errors",
-                    index=False
-                )
-
-            if "performance" in data:
-
-                perf_rows = [
-                    {
-                        "Category": k,
-                        "Count": v
-                    }
-                    for k, v in data["performance"].items()
-                ]
-
-                pd.DataFrame(perf_rows).to_excel(
-                    writer,
-                    sheet_name="Performance",
-                    index=False
-                )
-
-            if "prediction" in data:
-
-                pred = data["prediction"]
-
-                if "chart" in pred:
-
-                    pd.DataFrame(pred["chart"]).to_excel(
-                        writer,
-                        sheet_name="Prediction",
-                        index=False
-                    )
-
-        buffer.seek(0)
-
         return StreamingResponse(
             buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
