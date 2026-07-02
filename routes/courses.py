@@ -184,6 +184,22 @@ async def upload_students_excel(course_id: int, file: UploadFile = File(...), db
     course = db.query(CourseDB).filter(CourseDB.id == course_id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
+    return await _do_upload_students(course, file, db)
+
+
+@router.post("/courses/by-code/{course_code}/upload-students")
+async def upload_students_by_code(course_code: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Same as upload-students but identified by course code (e.g. CS402) instead of numeric id."""
+    course = db.query(CourseDB).filter(
+        func.upper(CourseDB.code) == course_code.strip().upper()
+    ).first()
+    if not course:
+        raise HTTPException(status_code=404, detail=f"Course with code '{course_code}' not found")
+    return await _do_upload_students(course, file, db)
+
+
+async def _do_upload_students(course: CourseDB, file: UploadFile, db: Session):
+    """Shared logic for both upload-students endpoints."""
 
     content = await file.read()
 
@@ -199,7 +215,7 @@ async def upload_students_excel(course_id: int, file: UploadFile = File(...), db
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing columns: {missing}")
 
-    existing_ids = {r[0] for r in db.query(StudentDB.student_id).filter(StudentDB.course_id == course_id).all()}
+    existing_ids = {r[0] for r in db.query(StudentDB.student_id).filter(StudentDB.course_id == course.id).all()}
     to_add, skipped = [], 0
     has_dept = "department" in df.columns
 
@@ -214,13 +230,13 @@ async def upload_students_excel(course_id: int, file: UploadFile = File(...), db
             continue
         dept = str(row.get("department", "")).strip() if has_dept else ""
         to_add.append(StudentDB(student_id=sid, name=str(row["name"]).strip(),
-                                department=dept, course_id=course_id))
+                                department=dept, course_id=course.id))
         existing_ids.add(sid)
 
     if to_add:
         db.bulk_save_objects(to_add)
         db.flush()  # ensure new rows are visible to the COUNT query below
-    course.students = db.query(func.count(StudentDB.id)).filter(StudentDB.course_id == course_id).scalar()
+    course.students = db.query(func.count(StudentDB.id)).filter(StudentDB.course_id == course.id).scalar()
     db.commit()
     return {"message": f"Added {len(to_add)} student(s). Skipped {skipped} duplicate(s)."}
 

@@ -1704,7 +1704,11 @@ async def export_general_pdf(user_id: int, db: Session = Depends(get_db)):
 # ── Performance Upload ────────────────────────────────────────────────────────
 
 @app.post("/upload-performance")
-async def upload_performance_sheet(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_performance_sheet(
+    file: UploadFile = File(...),
+    user_id: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
     content = await file.read()
     try:
         df = pd.read_csv(io.BytesIO(content)) if file.filename.endswith(".csv") \
@@ -1712,26 +1716,69 @@ async def upload_performance_sheet(file: UploadFile = File(...), db: Session = D
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid or corrupted file.")
 
-    required = {"student_id", "course_id", "grade", "attendance"}
-    if not required.issubset(df.columns):
-        raise HTTPException(status_code=400, detail=f"File must contain: {required}")
+    # Normalise column names
+    df.columns = [str(c).strip().lower() for c in df.columns]
 
-    added = 0
+    # Accept either course_code or course_id column
+    has_code = "course_code" in df.columns
+    has_id   = "course_id"   in df.columns
+    if not has_code and not has_id:
+        raise HTTPException(
+            status_code=400,
+            detail="File must contain a 'course_code' column (e.g. CS402) or 'course_id' column."
+        )
+
+    required_other = {"student_id", "grade", "attendance"}
+    missing = required_other - set(df.columns)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"File must contain columns: {missing}")
+
+    # Build a cache: course_code (upper) -> CourseDB.id  to avoid per-row queries
+    _code_to_id: dict[str, int] = {}
+
+    def _resolve_course(row) -> int | None:
+        if has_code:
+            code = str(row["course_code"]).strip().upper()
+            if code in _code_to_id:
+                return _code_to_id[code]
+            course = db.query(CourseDB).filter(
+                func.upper(CourseDB.code) == code
+            ).first()
+            if course:
+                _code_to_id[code] = course.id
+                return course.id
+            return None
+        else:
+            raw = row["course_id"]
+            try:
+                return int(float(raw))
+            except (ValueError, TypeError):
+                return None
+
+    added, skipped = 0, 0
     for _, row in df.iterrows():
+        resolved_course_id = _resolve_course(row)
+        if resolved_course_id is None:
+            skipped += 1
+            continue
+
         student = db.query(StudentDB).filter(
-            StudentDB.student_id == str(row["student_id"]),
-            StudentDB.course_id == int(row["course_id"])
+            StudentDB.student_id == str(row["student_id"]).strip(),
+            StudentDB.course_id  == resolved_course_id
         ).first()
         if student:
             db.add(PerformanceDB(
-                student_id=student.id,
-                course_id=int(row["course_id"]),
-                grade=float(row["grade"]),
-                attendance=float(row["attendance"])
+                student_id  = student.id,
+                course_id   = resolved_course_id,
+                grade       = float(row["grade"]),
+                attendance  = float(row["attendance"]),
             ))
             added += 1
+        else:
+            skipped += 1
+
     db.commit()
-    return {"message": f"Successfully processed {added} records"}
+    return {"message": f"Successfully processed {added} record(s). Skipped {skipped} (unknown course or student)."}
 
 
 # ── File Extraction ───────────────────────────────────────────────────────────
