@@ -483,8 +483,7 @@ def department_benchmarks(
             .distinct()
             .count()
         )
-
-    your_assignment_completion = (submitted * 100.0) / total_assign
+        your_assignment_completion = (submitted * 100.0) / total_assign
 
     assign_dept = db.query(AssignmentDB).join(CourseDB)
 
@@ -598,6 +597,303 @@ def create_scatter_chart(points):
     plt.savefig(path)
     plt.close()
     return path
+def get_at_risk_students(
+    db,
+    course_id=None,
+    semester=None,
+    department_id=None
+):
+    """
+    Get filtered students and calculate risk using:
+    Grade + Attendance
+    """
+
+    query = db.query(
+        StudentDB.student_id.label("student_id"),
+        StudentDB.name.label("student_name"),
+        PerformanceDB.grade,
+        PerformanceDB.attendance
+    ).join(
+        PerformanceDB,
+        StudentDB.id == PerformanceDB.student_id
+    )
+
+    if course_id:
+        query = query.filter(
+            PerformanceDB.course_id == course_id
+        )
+
+
+    if semester and semester.strip() and semester != "All Semesters":
+        query = query.join(
+            CourseDB,
+            CourseDB.id == PerformanceDB.course_id
+        ).filter(
+            CourseDB.semester == semester.strip()
+        )
+
+    if department_id:
+        query = query.filter(
+            StudentDB.department_id == department_id
+        )
+
+
+    students = query.all()
+
+
+    risk_students = []
+
+
+    for student in students:
+
+
+        # Grade risk
+
+        grade_risk = 100 - float(student.grade)
+
+
+        # Attendance risk
+
+        attendance_risk = 100 - float(student.attendance)
+
+
+
+        # Risk score
+
+        risk_score = (
+            (grade_risk * 0.7)
+            +
+            (attendance_risk * 0.3)
+        )
+
+
+
+        # Risk level
+        # Direct grade override: below 55 is always High risk
+        if float(student.grade) < 55:
+            risk_level = "High"
+
+        elif risk_score >= 60:
+            risk_level = "High"
+
+        elif risk_score >= 45:
+            risk_level = "Medium"
+
+        else:
+            risk_level = "Low"
+
+
+
+        # Only add risky students
+
+        if risk_level != "Low":
+
+
+            risk_students.append({
+
+                "Student ID":
+                    student.student_id,
+
+
+                "Student Name":
+                    student.student_name,
+
+
+                "Grade":
+                    student.grade,
+
+
+                "Attendance":
+                    student.attendance,
+
+
+                "Risk Score":
+                    round(risk_score, 2),
+
+
+                "Risk Level":
+                    risk_level
+
+            })
+
+
+    return risk_students
+def generate_recommendations(perf_dist, correlation, errors, prediction, at_risk_list):
+    """
+    Analyse the collected analytics data and return a list of actionable
+    recommendations for the professor.  Each recommendation is a dict:
+        {
+            "priority": "High" | "Medium" | "Low",
+            "area":     short label,
+            "finding":  what the data shows,
+            "action":   concrete thing the professor should do,
+        }
+    """
+    recs = []
+
+    # ── 1. Grade distribution ─────────────────────────────────────────────
+    total_students = sum(perf_dist.values()) if perf_dist else 0
+    at_risk_count  = len(at_risk_list)
+
+    if total_students > 0:
+        at_risk_pct    = (perf_dist.get("At-Risk (<70)", 0) / total_students) * 100
+        excellent_pct  = (perf_dist.get("Excellent (90-100)", 0) / total_students) * 100
+        avg_grade_vals = []
+        weights        = {"Excellent (90-100)": 95, "Good (80-89)": 84,
+                          "Average (70-79)": 74, "At-Risk (<70)": 55}
+        for bucket, cnt in perf_dist.items():
+            avg_grade_vals.extend([weights.get(bucket, 60)] * cnt)
+        class_avg = sum(avg_grade_vals) / len(avg_grade_vals) if avg_grade_vals else 0
+
+        if at_risk_pct >= 40:
+            recs.append({
+                "priority": "High",
+                "area": "Overall Performance",
+                "finding": f"{at_risk_pct:.0f}% of students are below 70 — class average is approximately {class_avg:.0f}%.",
+                "action": (
+                    "Conduct an urgent course review session. Revisit foundational topics "
+                    "and consider simplifying assessment difficulty or adding remedial materials."
+                ),
+            })
+        elif at_risk_pct >= 20:
+            recs.append({
+                "priority": "Medium",
+                "area": "Overall Performance",
+                "finding": f"{at_risk_pct:.0f}% of students are below 70.",
+                "action": (
+                    "Schedule targeted revision sessions for weaker topics. "
+                    "Identify the specific modules where grades drop and reinforce them."
+                ),
+            })
+
+        if excellent_pct >= 50 and at_risk_pct <= 10:
+            recs.append({
+                "priority": "Low",
+                "area": "Overall Performance",
+                "finding": f"{excellent_pct:.0f}% of students are in the Excellent range.",
+                "action": (
+                    "Class is performing well. Consider introducing advanced extension tasks "
+                    "or research challenges to keep high achievers engaged."
+                ),
+            })
+
+
+    # ── 2. Attendance correlation ─────────────────────────────────────────
+    r2 = correlation.get("stats", {}).get("r_squared", 0) if correlation else 0
+    if r2 >= 0.5:
+        recs.append({
+            "priority": "High",
+            "area": "Attendance",
+            "finding": f"Attendance strongly predicts grade performance (R² = {r2:.2f}).",
+            "action": (
+                "Enforce attendance policy and introduce engagement incentives. "
+                "Follow up with students who have missed more than 2 consecutive sessions."
+            ),
+        })
+    elif r2 >= 0.3:
+        recs.append({
+            "priority": "Medium",
+            "area": "Attendance",
+            "finding": f"Moderate link between attendance and grades (R² = {r2:.2f}).",
+            "action": (
+                "Monitor attendance trends. Send reminders to students with declining "
+                "attendance before it starts affecting their performance."
+            ),
+        })
+
+    # ── 3. Error category analysis ────────────────────────────────────────
+    if errors:
+        top_error = errors[0]  # already sorted by frequency
+        cat   = top_error.get("category", "")
+        pct   = top_error.get("percentage", 0)
+        count = top_error.get("affected_students", 0)
+
+        action_map = {
+            "Conceptual": (
+                "Students are struggling with core concepts. Dedicate extra lecture time "
+                "to the most misunderstood topics and use concept-check quizzes."
+            ),
+            "Structural": (
+                "Students have difficulty organising their answers. Provide clear templates "
+                "and examples of well-structured responses for upcoming assignments."
+            ),
+            "Language": (
+                "Language and clarity issues are common. Recommend academic writing "
+                "resources and consider holding a writing workshop."
+            ),
+            "Completeness": (
+                "Students consistently miss required points. Make assessment criteria more "
+                "explicit — share a detailed marking rubric before each assignment."
+            ),
+        }
+
+        recs.append({
+            "priority": "High" if pct >= 40 else "Medium",
+            "area": f"Error Pattern — {cat}",
+            "finding": (
+                f"{cat} errors are the most frequent ({pct:.0f}% of all errors, "
+                f"affecting {count} student(s))."
+            ),
+            "action": action_map.get(cat, "Review related course material with the class."),
+        })
+
+        # Second-most-common error if significant
+        if len(errors) >= 2:
+            second = errors[1]
+            s_cat  = second.get("category", "")
+            s_pct  = second.get("percentage", 0)
+            if s_pct >= 20 and s_cat != cat:
+                recs.append({
+                    "priority": "Medium",
+                    "area": f"Error Pattern — {s_cat}",
+                    "finding": f"{s_cat} errors represent {s_pct:.0f}% of all errors.",
+                    "action": action_map.get(s_cat, "Review related course material."),
+                })
+
+    # ── 4. Predictive trend ───────────────────────────────────────────────
+    if prediction and prediction.get("chart"):
+        chart = prediction["chart"]
+        actual_points = [c["actual"] for c in chart if c.get("actual") is not None]
+        pred_points   = [c["predicted"] for c in chart if c.get("predicted") is not None]
+
+        if len(actual_points) >= 2:
+            trend_direction = actual_points[-1] - actual_points[0]
+            final_pred      = pred_points[-1] if pred_points else None
+
+            if trend_direction < -5:
+                recs.append({
+                    "priority": "High",
+                    "area": "Performance Trend",
+                    "finding": (
+                        f"Class average is declining (dropped {abs(trend_direction):.1f}% "
+                        f"over the recorded period)."
+                        + (f" Forecast: {final_pred:.0f}% by end of term." if final_pred else "")
+                    ),
+                    "action": (
+                        "Investigate what changed in recent weeks — new topics, harder assignments, "
+                        "or reduced engagement. Adjust pacing or difficulty accordingly."
+                    ),
+                })
+            elif trend_direction > 5:
+                recs.append({
+                    "priority": "Low",
+                    "area": "Performance Trend",
+                    "finding": (
+                        f"Class average is improving (+{trend_direction:.1f}% over the period)."
+                        + (f" Forecast: {final_pred:.0f}% by end of term." if final_pred else "")
+                    ),
+                    "action": (
+                        "Current teaching strategy is working well. "
+                        "Keep the momentum and maintain the same feedback approach."
+                    ),
+                })
+
+    # Sort: High first, then Medium, then Low
+    priority_order = {"High": 0, "Medium": 1, "Low": 2}
+    recs.sort(key=lambda r: priority_order.get(r["priority"], 3))
+
+    return recs
+
 
 def export_report(
     db,
@@ -610,6 +906,17 @@ def export_report(
 ):
 
     data = {}
+
+    # Always collect performance + errors for recommendations,
+    # regardless of which toggles the professor chose
+    _perf_all  = get_performance_distribution(db, course_id, semester, days, from_date, to_date)
+    _corr_all  = get_attendance_correlation_report(db, course_id, semester, days, from_date, to_date)
+    _err_all   = common_error_analysis(db, course_id, semester, days, from_date, to_date)
+    _pred_all  = get_prediction(db, course_id, semester, days, from_date, to_date)
+    _risk_all  = get_at_risk_students(db, course_id=course_id, semester=semester)
+    data["recommendations"] = generate_recommendations(
+        _perf_all, _corr_all, _err_all, _pred_all, _risk_all
+    )
 
     if getattr(config, "grade_distribution", False):
         data["performance"] = get_performance_distribution(
@@ -639,6 +946,11 @@ def export_report(
     if getattr(config, "include_pii", False):
         data["students"] = get_student_insights(
             db, course_id, semester, days, from_date, to_date
+        )
+
+    if getattr(config, "include_at_risk", False):
+        data["at_risk"] = get_at_risk_students(
+            db, course_id=course_id, semester=semester
         )
 
     # =====================================================
@@ -771,6 +1083,98 @@ def export_report(
         elements.append(Spacer(1, 18))
 
         # =====================================================
+        # RECOMMENDATIONS
+        # =====================================================
+
+        recs = data.get("recommendations", [])
+
+        if recs:
+            elements.append(Paragraph("Recommendations & Insights", section_style))
+            elements.append(
+                Paragraph(
+                    "Based on the collected analytics, the following actions are recommended "
+                    "to improve student outcomes and course effectiveness.",
+                    description_style,
+                )
+            )
+            elements.append(Spacer(1, 8))
+
+            priority_colors = {
+                "High":   colors.HexColor("#FEF2F2"),
+                "Medium": colors.HexColor("#FFFBEB"),
+                "Low":    colors.HexColor("#F0FDF4"),
+            }
+            priority_text_colors = {
+                "High":   colors.HexColor("#DC2626"),
+                "Medium": colors.HexColor("#D97706"),
+                "Low":    colors.HexColor("#16A34A"),
+            }
+
+            # Paragraph styles for wrapping inside cells
+            cell_style = ParagraphStyle(
+                "CellStyle",
+                parent=styles["BodyText"],
+                fontSize=9,
+                leading=13,
+                textColor=colors.HexColor("#111827"),
+            )
+            header_cell_style = ParagraphStyle(
+                "HeaderCellStyle",
+                parent=styles["BodyText"],
+                fontSize=9,
+                leading=13,
+                textColor=colors.white,
+                fontName="Helvetica-Bold",
+            )
+
+            rec_rows = [[
+                Paragraph("Priority", header_cell_style),
+                Paragraph("Area", header_cell_style),
+                Paragraph("Finding", header_cell_style),
+                Paragraph("Recommended Action", header_cell_style),
+            ]]
+
+            for r in recs:
+                p_color = priority_text_colors.get(r["priority"], colors.black)
+                priority_style = ParagraphStyle(
+                    f"P_{r['priority']}",
+                    parent=cell_style,
+                    textColor=p_color,
+                    fontName="Helvetica-Bold",
+                    alignment=1,  # center
+                )
+                rec_rows.append([
+                    Paragraph(r["priority"], priority_style),
+                    Paragraph(r["area"], cell_style),
+                    Paragraph(r["finding"], cell_style),
+                    Paragraph(r["action"], cell_style),
+                ])
+
+            rec_table = Table(
+                rec_rows,
+                colWidths=[55, 120, 265, 210],
+            )
+
+            rec_style = [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#10B981")),
+                ("GRID",       (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+                ("VALIGN",     (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING",    (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+            ]
+
+            # Colour the priority cell background per row
+            for i, r in enumerate(recs, start=1):
+                bg = priority_colors.get(r["priority"], colors.white)
+                rec_style.append(("BACKGROUND", (0, i), (0, i), bg))
+
+            rec_table.setStyle(TableStyle(rec_style))
+            elements.append(rec_table)
+            elements.append(Spacer(1, 18))
+
+        # =====================================================
         # PERFORMANCE CHART
         # =====================================================
 
@@ -898,7 +1302,7 @@ def export_report(
                 ["Week", "Actual", "Predicted"]
             ]
 
-            for row in prediction_chart[:6]:
+            for row in prediction_chart:
 
                 prediction_rows.append([
                     str(row.get("label", "-")),
@@ -1041,7 +1445,7 @@ def export_report(
                 ["Student ID", "Name", "Department"]
             ]
 
-            for s in students_list[:8]:
+            for s in students_list:
 
                 student_rows.append([
                     str(s["id"]),
@@ -1077,6 +1481,94 @@ def export_report(
             elements.append(Spacer(1, 14))
 
         # =====================================================
+        # AT-RISK STUDENTS
+        # =====================================================
+
+        at_risk_list = data.get("at_risk", [])
+
+        if len(at_risk_list) > 0:
+
+            elements.append(
+                Paragraph("At-Risk Students", section_style)
+            )
+
+            elements.append(
+                Paragraph(
+                    "The following students have been identified as at risk based on "
+                    "their grade and attendance scores. Risk Score = (grade risk × 0.7) + (attendance risk × 0.3). "
+                    "Immediate intervention is recommended.",
+                    description_style,
+                )
+            )
+
+            elements.append(Spacer(1, 6))
+
+            cell_wrap = ParagraphStyle(
+                "AtRiskCell",
+                parent=styles["BodyText"],
+                fontSize=9,
+                leading=12,
+                textColor=colors.HexColor("#111827"),
+            )
+            hdr_wrap = ParagraphStyle(
+                "AtRiskHdr",
+                parent=cell_wrap,
+                textColor=colors.white,
+                fontName="Helvetica-Bold",
+            )
+
+            at_risk_rows = [[
+                Paragraph("Student ID", hdr_wrap),
+                Paragraph("Name", hdr_wrap),
+                Paragraph("Grade", hdr_wrap),
+                Paragraph("Attendance", hdr_wrap),
+                Paragraph("Risk Score", hdr_wrap),
+                Paragraph("Risk Level", hdr_wrap),
+            ]]
+
+            for s in at_risk_list:
+                level = s.get("Risk Level", "-")
+                level_color = (
+                    colors.HexColor("#DC2626") if level == "High"
+                    else colors.HexColor("#D97706") if level == "Medium"
+                    else colors.HexColor("#111827")
+                )
+                level_style = ParagraphStyle(
+                    f"RiskLevel_{level}",
+                    parent=cell_wrap,
+                    textColor=level_color,
+                    fontName="Helvetica-Bold",
+                    alignment=1,
+                )
+                at_risk_rows.append([
+                    Paragraph(str(s.get("Student ID", "-")), cell_wrap),
+                    Paragraph(str(s.get("Student Name", "-")), cell_wrap),
+                    Paragraph(str(s.get("Grade", "-")), cell_wrap),
+                    Paragraph(str(s.get("Attendance", "-")), cell_wrap),
+                    Paragraph(str(s.get("Risk Score", "-")), cell_wrap),
+                    Paragraph(level, level_style),
+                ])
+
+            at_risk_table = Table(
+                at_risk_rows,
+                colWidths=[80, 170, 60, 70, 70, 60],
+            )
+
+            at_risk_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EF4444")),
+                ("GRID",       (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+                ("ALIGN",      (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING",    (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+            ]))
+
+            elements.append(at_risk_table)
+            elements.append(Spacer(1, 14))
+
+        # =====================================================
         # ERROR ANALYSIS
         # =====================================================
 
@@ -1087,23 +1579,36 @@ def export_report(
         ):
             # New shape: category / total_errors / percentage /
             #            affected_students / notes[{description, assignment}]
-            error_rows = [
-                ["Category", "Affected Students", "% of Errors", "Description (latest)"]
-            ]
+            err_cell = ParagraphStyle(
+                "ErrCell",
+                parent=styles["BodyText"],
+                fontSize=9,
+                leading=12,
+                textColor=colors.HexColor("#111827"),
+            )
+            err_hdr = ParagraphStyle(
+                "ErrHdr",
+                parent=err_cell,
+                textColor=colors.white,
+                fontName="Helvetica-Bold",
+            )
+
+            error_rows = [[
+                Paragraph("Category", err_hdr),
+                Paragraph("Affected Students", err_hdr),
+                Paragraph("% of Errors", err_hdr),
+                Paragraph("Description (latest)", err_hdr),
+            ]]
 
             for category in data["errors"][:5]:
                 notes = category.get("notes", [])
-                # Take the most recent note as a representative description
                 latest_note = notes[0].get("description", "-") if notes else "-"
-                # Truncate long descriptions so they fit in the PDF cell
-                if len(latest_note) > 120:
-                    latest_note = latest_note[:117] + "..."
 
                 error_rows.append([
-                    str(category["category"]),
-                    str(category.get("affected_students", 0)),
-                    f"{category.get('percentage', 0)}%",
-                    latest_note,
+                    Paragraph(str(category["category"]), err_cell),
+                    Paragraph(str(category.get("affected_students", 0)), err_cell),
+                    Paragraph(f"{category.get('percentage', 0)}%", err_cell),
+                    Paragraph(latest_note, err_cell),
                 ])
 
             if len(error_rows) > 1:
@@ -1135,26 +1640,14 @@ def export_report(
                 )
 
                 error_table.setStyle(TableStyle([
-
-                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#10B981")),
-                    ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-
-                    ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D1D5DB")),
-
-                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-
-                    ('FONTSIZE', (0,0), (-1,-1), 9),
-
-                    # Left-align the description column for readability
-                    ('ALIGN', (0,0), (2,-1), 'CENTER'),
-                    ('ALIGN', (3,0), (3,-1), 'LEFT'),
-
-                    ('VALIGN', (0,0), (-1,-1), 'TOP'),
-
-                    ('TOPPADDING', (0,0), (-1,-1), 7),
-                    ('BOTTOMPADDING', (0,0), (-1,-1), 7),
-                    ('LEFTPADDING', (3,1), (3,-1), 6),
-
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#10B981")),
+                    ('GRID',       (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+                    ('VALIGN',     (0, 0), (-1, -1), 'TOP'),
+                    ('ALIGN',      (0, 0), (2, -1),  'CENTER'),
+                    ('TOPPADDING',    (0, 0), (-1, -1), 6),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                    ('LEFTPADDING',   (0, 0), (-1, -1), 6),
+                    ('RIGHTPADDING',  (0, 0), (-1, -1), 6),
                 ]))
 
                 elements.append(error_table)
@@ -1185,6 +1678,23 @@ def export_report(
 
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
+            # Recommendations sheet — always first
+            if data.get("recommendations"):
+                rec_rows = [
+                    {
+                        "Priority":             r["priority"],
+                        "Area":                 r["area"],
+                        "Finding":              r["finding"],
+                        "Recommended Action":   r["action"],
+                    }
+                    for r in data["recommendations"]
+                ]
+                pd.DataFrame(rec_rows).to_excel(
+                    writer,
+                    sheet_name="Recommendations",
+                    index=False,
+                )
+
             if "students" in data and data["students"].get("students"):
 
                 students_rows = [
@@ -1199,6 +1709,14 @@ def export_report(
                 pd.DataFrame(students_rows).to_excel(
                     writer,
                     sheet_name="Students",
+                    index=False
+                )
+
+            if "at_risk" in data and data["at_risk"]:
+
+                pd.DataFrame(data["at_risk"]).to_excel(
+                    writer,
+                    sheet_name="At-Risk Students",
                     index=False
                 )
 
@@ -1279,12 +1797,5 @@ def export_report(
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
                 "Content-Disposition": "attachment; filename=analytics_report.xlsx"
-            }
-        )
-        return StreamingResponse(
-            buffer,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": "attachment; filename=report.xlsx"
             }
         )

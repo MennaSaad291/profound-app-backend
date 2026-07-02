@@ -76,9 +76,22 @@ class CourseResponse(BaseModel):
 
 class LectureRequest(BaseModel):
     topic: str
-    pages_count: int = Field(default=10, ge=3, le=70)
+    pages_count: int = Field(default=12, ge=3, le=60)
     additional_instructions: str = ""
     theme: str = "Modern Minimalist"
+    reference_context: str = ""
+
+
+class LectureChatEditRequest(BaseModel):
+    lecture_id: str
+    slides: list
+    instruction: str
+    topic: str
+
+
+class LectureVersionRestoreRequest(BaseModel):
+    lecture_id: str
+    version_number: int
 
 
 class ExamRequest(BaseModel):
@@ -123,6 +136,7 @@ class ReportConfiguration(BaseModel):
     predictive_analytics: bool = True
     attendance_data: bool = True
     grade_distribution: bool = True
+    include_at_risk: bool = True
     export_format: str = "pdf"
 
 

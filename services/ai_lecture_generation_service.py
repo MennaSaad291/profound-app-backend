@@ -1,391 +1,573 @@
-"""
-AI Lecture Generation Service — Fast Outline-first approach
-=============================================================
-Phase 1 : ONE call generates a complete outline (all unique slide titles/subtopics).
-Phase 2 : Content batches run in PARALLEL GROUPS of 3 concurrent calls.
-          Each content call only gets its immediate neighbours as context (not the
-          entire outline) — this keeps prompts small and avoids TPM limits.
-
-Performance for 60 slides:
-  - 1 outline call  (~2 s)
-  - 12 batches of 5 slides → 4 parallel groups of 3  (~4 × 8 s = ~32 s)
-  - Total: ~35 s end-to-end (vs 90 s+ sequential)
-
-"Content unavailable" slides are eliminated by:
-  - Removing the full outline from every content prompt (was ~3 600 tokens for 60 slides)
-  - Increasing batch size (5) so fewer calls are needed overall
-  - Auto-retry on any failure before giving up
-"""
-import os, json, re, time
+import os, json, re, time, uuid, asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from groq import Groq
+from openai import OpenAI
 from fastapi import HTTPException
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY_LECTURE"))
+# ── OpenAI client (lazy) ─────────────────────────────────────────────────────
+_client: OpenAI | None = None
 
-MAX_SLIDES      = 70
-MIN_SLIDES      = 3
-BATCH_SIZE      = 5      # slides per content call  — 5 is the sweet-spot
-MAX_TOKENS      = 3200   # enough for 5 rich slides without overflow
-PARALLEL_GROUPS = 3      # concurrent content calls per wave
-INTER_WAVE_GAP  = 3      # seconds between waves of parallel calls
-RETRY_DELAYS    = [6, 18] # back-off on 429
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        key = os.getenv("OPENAI_API_KEY", "")
+        if not key:
+            raise HTTPException(status_code=500,
+                detail="OPENAI_API_KEY not set.")
+        _client = OpenAI(api_key=key)
+    return _client
+
+GPT_MODEL = "gpt-4o"
+GPT_MINI  = "gpt-4o-mini"
+
+MAX_SLIDES   = 60
+MIN_SLIDES   = 3
+BATCH_SIZE   = 8     # slides per GPT call — stays well within 16k token limit
+RETRY_DELAYS = [3, 8, 15]
+
+_version_store: dict[str, list] = {}
+
+NO_IMAGE_TITLES = {
+    "learning objectives", "objectives", "prerequisites",
+    "summary", "key takeaways", "takeaways",
+    "review questions", "questions", "further reading",
+    "references", "agenda", "conclusion", "discussion",
+    "quiz", "exercise", "activity",
+}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 1 — Outline
-# ─────────────────────────────────────────────────────────────────────────────
+# ── GPT caller ────────────────────────────────────────────────────────────────
 
-def _gen_outline(topic: str, total: int, prof_note: str) -> list:
-    has_custom = (prof_note and prof_note.strip()
-                  and prof_note.strip() != "Produce a thorough, student-friendly academic lecture.")
-    note_block = f"Professor instructions: {prof_note}\n" if has_custom else ""
-
-    prompt = f"""Design a {total}-slide university lecture on "{topic}".
-{note_block}Every slide must cover a UNIQUE subtopic — NO repetition.
-Flow: Title → Objectives → Overview → Core content (many specific sub-topics) → Summary.
-
-Slide 1: Title slide
-Slide 2: Learning Objectives
-Slide 3: Lecture Overview / Roadmap
-Slides 4-{total - 1}: Core content — list {total - 4} completely distinct sub-topics of "{topic}"
-Slide {total}: Summary & Key Takeaways
-
-Return ONLY a JSON array of exactly {total} objects:
-[{{"slide":1,"title":"string","subtopic":"one sentence — exactly what this slide covers"}}]
-No markdown, no explanation, just the JSON array."""
-
-    for attempt in range(3):
+def _call_gpt(prompt: str, model: str = GPT_MODEL,
+              max_tokens: int = 8000, temperature: float = 0.2) -> str:
+    for attempt in range(4):
         try:
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            resp = _get_client().chat.completions.create(
+                model=model,
                 messages=[
-                    {"role": "system", "content": "Output ONLY a valid JSON array. No markdown."},
-                    {"role": "user",   "content": prompt},
+                    {"role": "system", "content":
+                     "You are a senior university professor creating professional lecture slides. "
+                     "Output ONLY valid JSON matching the schema exactly. No markdown."},
+                    {"role": "user", "content": prompt}
                 ],
-                temperature=0.4,
-                max_tokens=min(total * 55, 4000),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
             )
-            raw = _strip_fences(resp.choices[0].message.content.strip())
-            idx = raw.find('[')
-            if idx == -1:
-                raise ValueError("No JSON array found")
-            outline = json.loads(_fix_array(raw[idx:]))
-            if not isinstance(outline, list) or len(outline) < total * 0.75:
-                raise ValueError(f"Short outline: {len(outline)}")
-            return outline[:total]
+            return resp.choices[0].message.content
         except Exception as e:
-            err = str(e).lower()
-            if ("rate" in err or "429" in err) and attempt < 2:
-                wait = RETRY_DELAYS[attempt]
-                print(f"[Outline] 429 — waiting {wait}s"); time.sleep(wait); continue
-            print(f"[Outline] failed attempt {attempt+1}: {e}")
-
-    return _fallback_outline(topic, total)
-
-
-def _fallback_outline(topic: str, total: int) -> list:
-    """Deterministic outline — used only if AI outline fails entirely."""
-    sections = [
-        "Definitions and Terminology",
-        "Historical Background and Context",
-        "Core Principles and Theory",
-        "Fundamental Mechanisms",
-        "Key Components and Architecture",
-        "Classification and Taxonomy",
-        "Mathematical Foundations",
-        "Algorithms and Methods",
-        "Data Structures and Representations",
-        "Design Patterns and Best Practices",
-        "Implementation Techniques",
-        "Performance Analysis and Complexity",
-        "Common Challenges and Pitfalls",
-        "Optimisation Strategies",
-        "Security Considerations",
-        "Scalability and Reliability",
-        "Comparison with Alternative Approaches",
-        "Industry Standards and Protocols",
-        "Tools and Frameworks",
-        "Testing and Validation",
-        "Real-World Case Studies",
-        "Current Research and Open Problems",
-        "Future Directions and Trends",
-        "Ethical and Social Implications",
-        "Integration with Other Domains",
-    ]
-    out = [
-        {"slide": 1, "title": topic,                  "subtopic": "Title and lecture introduction"},
-        {"slide": 2, "title": "Learning Objectives",   "subtopic": "Measurable learning outcomes"},
-        {"slide": 3, "title": "Lecture Overview",      "subtopic": "Roadmap of today's topics"},
-    ]
-    core = total - 4
-    for i in range(core):
-        sec = sections[i % len(sections)]
-        out.append({
-            "slide":    len(out) + 1,
-            "title":    f"{sec}",
-            "subtopic": f"{sec} as applied to {topic}",
-        })
-    out.append({"slide": total, "title": "Summary & Key Takeaways",
-                "subtopic": "Synthesis of all covered concepts"})
-    return out[:total]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 2 — Content (parallel groups)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _content_prompt(batch: list, topic: str, total: int,
-                    prof_note: str, depth: str,
-                    prev_title: str, next_title: str) -> str:
-    """
-    Compact prompt. Only sends:
-    • The assigned subtopics for this batch
-    • One slide of context before and after (anti-repetition)
-    NOT the full outline — that was the token hog.
-    """
-    has_custom = (prof_note and prof_note.strip()
-                  and prof_note.strip() != "Produce a thorough, student-friendly academic lecture.")
-    note_block = f"Professor instructions: {prof_note}\n" if has_custom else ""
-
-    specs = "\n".join(
-        f"Slide {o['slide']}: \"{o['title']}\" — {o['subtopic']}"
-        for o in batch
-    )
-    border = ""
-    if prev_title:
-        border += f"Previous slide already covered: \"{prev_title}\" — do NOT repeat that content.\n"
-    if next_title:
-        border += f"Next slide will cover: \"{next_title}\" — do NOT pre-empt that content.\n"
-
-    count = len(batch)
-    s, e  = batch[0]['slide'], batch[-1]['slide']
-
-    return f"""Generate slides {s}-{e} of a {total}-slide university lecture on "{topic}".
-{note_block}{border}
-Assign each slide ONLY its listed subtopic:
-{specs}
-
-Depth: {depth}
-
-Return EXACTLY {count} slide objects as JSON:
-{{"slides":[{{"title":"exact title above","points":[{{"headline":"5-7 word headline","detail":"2-3 sentences"}}],"example":"one concrete named example or empty string","image_suggestion":"specific diagram/chart description","speaker_notes":"2-3 sentences for the lecturer"}}]}}
-
-Rules: exactly {count} slides, root key "slides", no markdown."""
-
-
-def _gen_content_batch(batch: list, topic: str, total: int,
-                       prof_note: str, depth: str,
-                       prev_title: str, next_title: str) -> list:
-    count = len(batch)
-    prompt = _content_prompt(batch, topic, total, prof_note, depth, prev_title, next_title)
-
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system",
-                     "content": "Output ONLY valid JSON. No markdown. Start with { end with }."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                max_tokens=MAX_TOKENS,
-            )
-            raw   = _strip_fences(resp.choices[0].message.content.strip())
-            match = re.search(r'\{', raw)
-            if not match:
-                raise ValueError("No JSON object")
-            parsed = _parse_safe(raw[match.start():])
-            slides = parsed.get("slides") or next(
-                (v for v in parsed.values() if isinstance(v, list) and v), [])
-            cleaned = _clean(slides)
-            # Pin titles to outline values
-            for i, sl in enumerate(cleaned):
-                if i < count:
-                    sl['title'] = batch[i]['title']
-            return cleaned
-
-        except Exception as e:
-            err = str(e).lower()
-            if ("rate" in err or "429" in err) and attempt < 2:
-                wait = RETRY_DELAYS[attempt]
-                print(f"[Batch {batch[0]['slide']}-{batch[-1]['slide']}] 429 — waiting {wait}s")
+            err = str(e)
+            if "rate_limit" in err.lower() or "429" in err:
+                wait = RETRY_DELAYS[min(attempt, 2)]
+                print(f"[GPT] Rate limit — waiting {wait}s")
                 time.sleep(wait); continue
-            print(f"[Batch {batch[0]['slide']}-{batch[-1]['slide']}] err attempt {attempt+1}: {e}")
-
-    # Last resort — generate placeholder WITH actual title (never "Content unavailable" as title)
-    return [{
-        "title":            o['title'],
-        "points":           [{"headline": o['subtopic'][:60],
-                              "detail":   f"Core content about {o['subtopic']}."}],
-        "example":          "",
-        "image_suggestion": f"Diagram illustrating {o['title']}",
-        "speaker_notes":    f"Explain {o['subtopic']} in detail.",
-    } for o in batch]
+            if attempt < 3:
+                print(f"[GPT] attempt {attempt+1} failed: {err[:80]}")
+                time.sleep(RETRY_DELAYS[min(attempt, 2)]); continue
+            raise
+    raise RuntimeError("GPT failed after 4 attempts")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
+# ── JSON utilities ────────────────────────────────────────────────────────────
 
-def _depth_instruction(total: int) -> str:
-    if total <= 15:
-        return "3 points per slide, each 2-3 sentences"
-    elif total <= 35:
-        return "3 points per slide, each 2 sentences"
-    else:
-        return "3 points per slide, each 1-2 sentences; be concise but informative"
+def _md(text: str) -> str:
+    return re.sub(r'\*+', '', str(text)).replace("__", "").strip()
 
+def _should_have_image(title: str) -> bool:
+    t = title.lower().strip()
+    return not any(kw in t for kw in NO_IMAGE_TITLES)
 
-def _strip_fences(raw: str) -> str:
-    raw = re.sub(r'^```json\s*', '', raw)
-    raw = re.sub(r'^```\s*',     '', raw)
-    raw = re.sub(r'\s*```$',     '', raw)
-    return raw.strip()
+def _validate_image_prompt(prompt: str, title: str) -> str:
+    """Ensure image_prompt is a real DALL-E prompt, not a filename."""
+    if not prompt: return ""
+    p = prompt.strip()
+    bad_exts = ('.png','.jpg','.jpeg','.svg','.webp','.gif','.bmp')
+    if any(p.lower().endswith(ext) for ext in bad_exts) or len(p) < 30:
+        return (f"A professional educational illustration for a university slide about '{title}'. "
+                f"Clear diagram showing the concept, clean white background, textbook style.")
+    return p
 
+def _repair_json(raw: str) -> str:
+    """Extract complete slide objects from potentially truncated JSON."""
+    raw = raw.strip()
+    try: json.loads(raw); return raw
+    except Exception: pass
 
-def _fix_array(raw: str) -> str:
-    last = raw.rfind(']')
-    raw  = raw[:last + 1] if last != -1 else raw
-    raw += ']' * max(0, raw.count('[') - raw.count(']'))
+    slides_pos = raw.find('"slides"')
+    arr_start  = raw.find('[', slides_pos if slides_pos != -1 else 0)
+    if arr_start == -1: return raw
+
+    content = raw[arr_start:]
+    objects, depth, start = [], 0, None
+    for i, ch in enumerate(content):
+        if ch == '{':
+            if depth == 0: start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(content[start:i+1])
+                    objects.append(obj)
+                except Exception: pass
+                start = None
+
+    if objects:
+        print(f"[JSON repair] Recovered {len(objects)} slides")
+        return json.dumps({"slides": objects})
     return raw
 
 
-def _fix_obj(raw: str) -> str:
-    last = raw.rfind('}')
-    if last == -1: return raw
-    raw  = raw[:last + 1]
-    raw += ']' * max(0, raw.count('[') - raw.count(']'))
-    raw += '}' * max(0, raw.count('{') - raw.count('}'))
-    return raw
+# ── Slide cleaner ─────────────────────────────────────────────────────────────
 
-
-def _parse_safe(text: str) -> dict:
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return json.loads(_fix_obj(text))
-
-
-def _clean(slides_list: list) -> list:
+def _clean_slides(raw_list: list) -> list:
     out = []
-    for s in slides_list:
+    for s in raw_list:
         if not isinstance(s, dict): continue
         rp = s.get("points", [])
         if isinstance(rp, str): rp = [{"headline": rp, "detail": ""}]
         pts = []
         for p in rp:
             if isinstance(p, dict):
-                pts.append({"headline": str(p.get("headline", p.get("title", ""))).strip(),
-                            "detail":   str(p.get("detail",   p.get("explanation", ""))).strip()})
-            elif isinstance(p, str):
-                pts.append({"headline": p.strip(), "detail": ""})
-        ex = s.get("example", "")
-        if isinstance(ex, list): ex = " ".join(str(e) for e in ex)
-        ex = str(ex).strip()
-        img = s.get("image_suggestion")
-        if img and str(img).lower() in ("null", "none", "n/a", ""): img = None
+                hl  = _md(p.get("headline", p.get("title", ""))).strip()
+                det = _md(p.get("detail",   p.get("explanation", ""))).strip()
+                if hl: pts.append({"headline": hl, "detail": det})
+            elif isinstance(p, str) and p.strip():
+                pts.append({"headline": _md(p.strip()), "detail": ""})
+
+        def sv(k, fb=""):
+            v = s.get(k) or fb
+            sv2 = _md(str(v))
+            return "" if sv2.lower() in ("null","none","n/a","") else sv2
+
+        ex = s.get("example","")
+        if isinstance(ex, list): ex = " | ".join(str(e) for e in ex)
+        ex = _md(str(ex).strip())
+        if ex.lower() in ("null","none","n/a",""): ex = ""
+
+        title = sv("title") or "Slide"
+
+        img_q = sv("image_keyword") or sv("image_search_query") or ""
+        if not _should_have_image(title): img_q = ""
+
+        fallback = [
+            {"headline":"Core Definition",       "detail":f"Precise definition of {title} as used in academic and professional contexts."},
+            {"headline":"Key Characteristics",   "detail":f"The main properties and attributes that define {title}."},
+            {"headline":"Practical Applications","detail":f"How {title} is applied in real-world engineering and professional settings."},
+            {"headline":"Performance Factors",   "detail":"Critical metrics, trade-offs, and efficiency considerations."},
+            {"headline":"Industry Standards",    "detail":"Best practices and standards adopted by leading organisations worldwide."},
+        ]
+        while len(pts) < 5:
+            pts.append(fallback[len(pts)])
+
         out.append({
-            "title":            str(s.get("title", "Slide")).strip(),
-            "points":           pts,
-            "example":          ex,
-            "image_suggestion": img,
-            "speaker_notes":    str(s.get("speaker_notes", "")).strip(),
+            "title":               title,
+            "points":              pts[:5],
+            "example":             ex,
+            "practical_example":   sv("practical_example"),
+            "industry_example":    sv("industry_example"),
+            "analogy":             sv("analogy"),
+            "code_example":        sv("code_example"),
+            "code_language":       sv("code_language"),
+            "diagram":             sv("diagram"),
+            "image_keyword":       img_q,
+            "image_search_query":  img_q,
+            "image_prompt":        _validate_image_prompt(sv("image_prompt"), title),
+            "image_suggestion":    sv("image_suggestion"),
+            "speaker_notes":       sv("speaker_notes"),
+            "professor_text":      sv("professor_text"),
+            "quiz_questions":      s.get("quiz_questions") or [],
+            "discussion_questions":s.get("discussion_questions") or [],
+            "assignments":         s.get("assignments") or [],
+            "tips":                s.get("tips") or [],
+            "common_mistakes":     s.get("common_mistakes") or [],
         })
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Slide batch prompt ────────────────────────────────────────────────────────
+
+def _batch_prompt(topic: str, batch_titles: list, covered_titles: list,
+                  prof_note: str, ref: str, is_last_batch: bool) -> str:
+    covered_block = ""
+    if covered_titles:
+        covered_block = f"\nAlready covered in previous slides (DO NOT REPEAT): {json.dumps(covered_titles)}\n"
+
+    last_note = ""
+    if is_last_batch:
+        last_note = f"""
+IMPORTANT — this is the LAST batch of the lecture.
+The last two slides in this batch MUST be:
+  - Second to last: "Summary & Key Takeaways" (synthesise all covered topics)
+  - Last: "Review Questions & Further Reading" (with quiz_questions, discussion_questions, assignments)
+"""
+
+    slides_to_make = "\n".join(f"  - {t}" for t in batch_titles)
+
+    custom = f"\nProfessor instructions (MANDATORY): {prof_note}\n" if prof_note.strip() else ""
+    ref_block = f"\nReference material: {ref[:600]}\n" if ref else ""
+
+    return f"""You are creating university lecture slides on "{topic}".
+{custom}{ref_block}{covered_block}{last_note}
+Generate content for exactly these {len(batch_titles)} slides:
+{slides_to_make}
+
+MANDATORY QUALITY STANDARDS for every slide:
+1. EXACTLY 5 bullet points
+2. headline: 5-10 word specific concept (e.g. "TCP Three-Way Handshake Process")
+3. detail: EXACTLY 2 complete sentences, 25-45 words total
+4. example: real company/person + specific numbers (e.g. "Google's network handles 8.5B searches daily")
+5. practical_example: one hands-on thing a student can try
+6. industry_example: how a Fortune 500 company uses this
+7. analogy: everyday life comparison
+8. speaker_notes: 3-4 rich sentences with analogy and class question
+9. image_prompt: descriptive DALL-E generation prompt (NOT a filename — write what to draw)
+   - e.g. "A detailed diagram of the OSI model showing 7 layers as colored horizontal bands with protocol labels, clean white background, textbook style"
+   - Leave EMPTY for: Summary, Review Questions, Learning Objectives, Prerequisites
+10. code_example: real runnable code ONLY for algorithm/implementation slides, else ""
+11. diagram: valid Mermaid syntax ONLY for process/flow/architecture slides, else ""
+12. NO markdown (**bold**) in any field
+
+For the Review Questions slide ONLY, populate:
+- quiz_questions: 5 MCQ objects: {{"question":"...","options":["A)...","B)...","C)...","D)..."],"answer":"A"}}
+- discussion_questions: 3 open-ended questions
+- assignments: 2 practical task descriptions
+
+Return exactly this JSON (root key = "slides"):
+{{"slides":[{{"title":"exact slide title","points":[{{"headline":"phrase","detail":"sentence 1. sentence 2."}}],"example":"...","practical_example":"...","industry_example":"...","analogy":"...","code_example":"","code_language":"","diagram":"","image_keyword":"3-5 words","image_prompt":"DALL-E prompt or empty","speaker_notes":"...","professor_text":"","quiz_questions":[],"discussion_questions":[],"assignments":[],"tips":[],"common_mistakes":[]}}]}}"""
+
+
+# ── Outline builder ───────────────────────────────────────────────────────────
+
+def _build_outline(topic: str, count: int, prof_note: str) -> list[str]:
+    """Ask GPT to plan exactly `count` unique slide titles."""
+    custom = f"\nProfessor instructions: {prof_note}\n" if prof_note.strip() else ""
+
+    prompt = f"""Plan a {count}-slide university lecture on "{topic}".{custom}
+Rules:
+- Every slide covers a UNIQUE, SPECIFIC subtopic — NO repeats
+- Slide 1: Title slide ("{topic}")
+- Slide 2: Learning Objectives
+- Slide 3: Prerequisites & Context
+- Slides 4 to {count-2}: Core content (UNIQUE topics: definitions, history, theory, types, mechanisms, algorithms, tools, security, best practices, mistakes, applications, case studies, comparisons, research, ethics, future)
+- Slide {count-1}: Summary & Key Takeaways
+- Slide {count}: Review Questions & Further Reading
+
+Return ONLY a JSON array of exactly {count} title strings:
+["Title 1", "Title 2", ...]"""
+
+    for attempt in range(3):
+        try:
+            raw    = _call_gpt(prompt, model=GPT_MODEL, max_tokens=count*30+500)
+            parsed = json.loads(raw)
+            # Handle both array and object with array value
+            if isinstance(parsed, list):
+                titles = [str(t).strip() for t in parsed if t]
+            else:
+                titles = next(([str(t).strip() for t in v if t]
+                               for v in parsed.values() if isinstance(v, list)), [])
+            if len(titles) >= count * 0.8:
+                return titles[:count]
+        except Exception as e:
+            print(f"[Outline] attempt {attempt+1}: {e}")
+            if attempt < 2: time.sleep(2)
+
+    # Fallback outline
+    core_topics = [
+        "Definitions and Terminology", "Historical Background and Evolution",
+        "Core Theory and Principles", "Types and Classification",
+        "Key Components and Architecture", "How It Works — Mechanisms",
+        "Algorithms and Methods", "Mathematical Foundations",
+        "Implementation and Tools", "Performance and Optimization",
+        "Security Considerations", "Best Practices", "Common Mistakes",
+        "Real-World Applications", "Industry Case Studies",
+        "Comparison with Alternatives", "Current Research Trends",
+        "Ethical Implications", "Future Directions", "Standards and Protocols",
+        "Tools and Frameworks", "Testing and Validation",
+        "Integration with Other Systems", "Scalability Considerations",
+    ]
+    titles = [topic]
+    titles += ["Learning Objectives", "Prerequisites & Context"]
+    for i in range(count - 5):
+        t = core_topics[i % len(core_topics)]
+        titles.append(f"{t} in {topic}")
+    titles += ["Summary & Key Takeaways", "Review Questions & Further Reading"]
+    return titles[:count]
+
+
+# ── Parallel image generation ─────────────────────────────────────────────────
+
+def _generate_all_images_parallel(slides: list) -> dict[str, bytes]:
+    """
+    Generate ALL slide images in parallel using a thread pool.
+    Returns dict: {image_prompt: bytes}
+    This is called server-side so all images are ready before the response is sent.
+    """
+    import requests as _req
+    import base64 as _b64
+
+    prompts = {
+        s["image_prompt"]: s["title"]
+        for s in slides
+        if s.get("image_prompt", "").strip()
+    }
+
+    if not prompts:
+        return {}
+
+    results: dict[str, bytes] = {}
+
+    def _fetch_one(prompt_title_pair):
+        prompt, title = prompt_title_pair
+        for attempt in range(2):
+            try:
+                resp = _get_client().images.generate(
+                    model="gpt-image-1",
+                    prompt=prompt,
+                    size="1024x1024",
+                    n=1,
+                )
+                img_data = resp.data[0]
+                if hasattr(img_data, "b64_json") and img_data.b64_json:
+                    return prompt, _b64.b64decode(img_data.b64_json)
+                if hasattr(img_data, "url") and img_data.url:
+                    r = _req.get(img_data.url, timeout=15)
+                    if r.status_code == 200:
+                        return prompt, r.content
+            except Exception as e:
+                print(f"[IMG] attempt {attempt+1} failed for '{title}': {e}")
+                if attempt == 0: time.sleep(2)
+        return prompt, None
+
+    # Use thread pool — all images generated concurrently
+    max_workers = min(len(prompts), 5)  # max 5 parallel image requests
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_one, (p, t)): p
+                   for p, t in prompts.items()}
+        for fut in as_completed(futures):
+            try:
+                prompt, img_bytes = fut.result()
+                if img_bytes:
+                    results[prompt] = img_bytes
+                    print(f"[IMG] Generated: {prompt[:40]}…")
+            except Exception as e:
+                print(f"[IMG] Future error: {e}")
+
+    print(f"[IMG] Parallel generation done: {len(results)}/{len(prompts)} succeeded")
+    return results
+
+
+# ── Main generation ───────────────────────────────────────────────────────────
 
 def generate_lecture_json(data) -> dict:
     requested  = max(MIN_SLIDES, min(int(data.pages_count), MAX_SLIDES))
-    topic      = data.topic
+    topic      = data.topic.strip()
     additional = getattr(data, "additional_instructions", "") or ""
-    prof_note  = additional or "Produce a thorough, student-friendly academic lecture."
-    depth      = _depth_instruction(requested)
+    prof_note  = additional.strip()
+    ref        = getattr(data, "reference_context", "") or ""
+    lecture_id = str(uuid.uuid4())
 
-    # ── Phase 1: Outline ───────────────────────────────────────────────────
-    print(f"[Lecture] Phase 1 — outline for {requested} slides on '{topic}'")
-    outline = _gen_outline(topic, requested, prof_note)
+    print(f"[GPT-4o] Generating {requested} slides on '{topic}'")
 
-    while len(outline) < requested:          # pad if outline was short
-        n = len(outline) + 1
-        outline.append({"slide": n, "title": f"{topic} — Part {n}",
-                         "subtopic": f"Additional aspect of {topic}"})
+    # ── Step 1: Build outline (unique titles for all slides) ──────────────────
+    print("[GPT-4o] Building outline…")
+    all_titles = _build_outline(topic, requested, prof_note)
+    # Ensure exactly `requested` titles
+    while len(all_titles) < requested:
+        all_titles.append(f"{topic} — Advanced Topic {len(all_titles)+1}")
+    all_titles = all_titles[:requested]
 
-    print(f"[Lecture] Outline done: {len(outline)} slides")
+    # Enforce: last 2 must be Summary + Review
+    all_titles[-2] = "Summary & Key Takeaways"
+    all_titles[-1] = "Review Questions & Further Reading"
 
-    # ── Phase 2: Content in parallel waves ────────────────────────────────
-    batches = [outline[i:i + BATCH_SIZE] for i in range(0, len(outline), BATCH_SIZE)]
-    results: dict[int, list] = {}
+    print(f"[GPT-4o] Outline: {all_titles}")
 
-    # Split batches into groups of PARALLEL_GROUPS; each group runs concurrently
-    groups = [batches[i:i + PARALLEL_GROUPS]
-              for i in range(0, len(batches), PARALLEL_GROUPS)]
+    # ── Step 2: Generate content in batches ───────────────────────────────────
+    # Split all titles into batches of BATCH_SIZE, ALWAYS keeping last 2 in final batch
+    core_titles   = all_titles[:-2]
+    tail_titles   = all_titles[-2:]
 
-    for g_idx, group in enumerate(groups):
-        if g_idx > 0:
-            time.sleep(INTER_WAVE_GAP)       # brief pause between waves
+    batches: list[list[str]] = []
+    for i in range(0, len(core_titles), BATCH_SIZE):
+        batches.append(core_titles[i:i+BATCH_SIZE])
+    # Add tail as its own batch (or merged with last batch if last batch is small)
+    if batches and len(batches[-1]) < BATCH_SIZE - 1:
+        batches[-1].extend(tail_titles)
+    else:
+        batches.append(tail_titles)
 
-        with ThreadPoolExecutor(max_workers=PARALLEL_GROUPS) as pool:
-            future_map = {}
-            for b_idx_in_group, batch in enumerate(group):
-                global_b_idx = g_idx * PARALLEL_GROUPS + b_idx_in_group
-                b_start = batch[0]['slide']
-                b_end   = batch[-1]['slide']
+    all_slides   = []
+    covered_list = []
 
-                # Neighbour titles for anti-repetition context
-                prev_title = outline[b_start - 2]['title'] if b_start > 1 else ""
-                next_title = outline[b_end]['title']       if b_end < requested else ""
+    for batch_idx, batch_titles in enumerate(batches):
+        is_last = (batch_idx == len(batches) - 1)
+        print(f"[GPT-4o] Batch {batch_idx+1}/{len(batches)}: {batch_titles}")
 
-                fut = pool.submit(
-                    _gen_content_batch,
-                    batch, topic, requested, prof_note, depth,
-                    prev_title, next_title
-                )
-                future_map[fut] = global_b_idx
+        prompt = _batch_prompt(topic, batch_titles, covered_list,
+                               prof_note, ref, is_last_batch=is_last)
 
-            for fut in as_completed(future_map):
-                b_idx = future_map[fut]
-                try:
-                    results[b_idx] = fut.result()
-                except Exception as e:
-                    batch = batches[b_idx]
-                    print(f"[Wave {g_idx}] batch {b_idx} unhandled: {e}")
-                    results[b_idx] = [{
-                        "title":            o['title'],
-                        "points":           [{"headline": o['subtopic'][:60],
-                                              "detail":   f"Core content about {o['subtopic']}."}],
-                        "example":          "",
-                        "image_suggestion": f"Diagram illustrating {o['title']}",
-                        "speaker_notes":    f"Explain {o['subtopic']}.",
-                    } for o in batch]
+        batch_slides = None
+        for attempt in range(4):
+            try:
+                raw = _call_gpt(prompt, model=GPT_MODEL,
+                                max_tokens=len(batch_titles)*600+500)
+                raw = _repair_json(raw)
+                parsed = json.loads(raw)
+                raw_slides = parsed.get("slides") or next(
+                    (v for v in parsed.values() if isinstance(v, list)), [])
+                if not raw_slides:
+                    raise ValueError("Empty slides")
+                batch_slides = _clean_slides(raw_slides)
+                print(f"[GPT-4o] Batch {batch_idx+1} OK: {len(batch_slides)} slides")
+                break
+            except Exception as e:
+                print(f"[GPT-4o] Batch {batch_idx+1} attempt {attempt+1}: {e}")
+                if attempt < 3: time.sleep(RETRY_DELAYS[min(attempt, 2)])
 
-        print(f"[Lecture] Wave {g_idx + 1}/{len(groups)} done")
+        if not batch_slides:
+            # Fallback: create basic slides for this batch
+            batch_slides = [{
+                "title": t, "points": [
+                    {"headline": f"{t} — Overview",      "detail": f"Core concept of {t} in the context of {topic}. Essential for understanding the subject."},
+                    {"headline": "Key Principles",       "detail": "Fundamental rules and properties that govern this topic."},
+                    {"headline": "Practical Application","detail": "How this concept is applied in real-world systems and products."},
+                    {"headline": "Industry Relevance",   "detail": "Why this matters in modern technology and engineering."},
+                    {"headline": "Common Challenges",    "detail": "Typical difficulties practitioners face and how to overcome them."},
+                ],
+                "example": f"Leading organisations use {t.lower()} to improve system performance.",
+                "practical_example":"","industry_example":"","analogy":"",
+                "code_example":"","code_language":"","diagram":"",
+                "image_keyword":"","image_prompt":"","image_suggestion":"",
+                "speaker_notes":f"Discuss {t}. Ask students for examples.",
+                "professor_text":"",
+                "quiz_questions":[],"discussion_questions":[],"assignments":[],
+                "tips":[],"common_mistakes":[],
+            } for t in batch_titles]
 
-    # ── Assemble in order ──────────────────────────────────────────────────
-    all_slides = []
-    for idx in sorted(results):
-        all_slides.extend(results[idx])
+        all_slides.extend(batch_slides)
+        covered_list.extend([s["title"] for s in batch_slides])
 
-    all_slides = all_slides[:requested]
-    while len(all_slides) < requested:
-        i     = len(all_slides)
-        title = outline[i]['title'] if i < len(outline) else f"Slide {i + 1}"
-        all_slides.append({
-            "title":            title,
-            "points":           [{"headline": "Key Concepts",
-                                  "detail":   f"Important aspects of {topic}."}],
-            "example":          "",
-            "image_suggestion": None,
-            "speaker_notes":    "",
-        })
+    # ── Step 3: Deduplicate — ensure Summary/Review only once at the end ──────
+    seen_titles = set()
+    deduped = []
+    tail_reserved = []
 
-    if not all_slides:
-        raise HTTPException(status_code=500, detail="Generation failed. Please try again.")
+    for s in all_slides:
+        t = s["title"].lower()
+        is_tail = any(k in t for k in ("summary", "key takeaway", "review question", "further reading"))
+        if is_tail:
+            # Only keep LAST occurrence of each tail slide type
+            tail_reserved = [x for x in tail_reserved if x["title"].lower() not in t]
+            tail_reserved.append(s)
+        elif s["title"] not in seen_titles:
+            seen_titles.add(s["title"])
+            deduped.append(s)
 
-    print(f"[Lecture] Complete — {len(all_slides)} slides")
-    return {"slides": all_slides}
+    # Ensure exactly 1 Summary and 1 Review at the very end
+    final = deduped
+    # Add tail slides (deduplicated)
+    tail_by_type = {}
+    for s in tail_reserved:
+        t = s["title"].lower()
+        key = "summary" if "summary" in t or "takeaway" in t else "review"
+        tail_by_type[key] = s  # last one wins
+
+    if "summary" in tail_by_type: final.append(tail_by_type["summary"])
+    if "review"  in tail_by_type: final.append(tail_by_type["review"])
+
+    # Trim/pad to exact count
+    final = final[:requested]
+    while len(final) < requested:
+        final.insert(-2 if len(final) >= 2 else len(final),
+                     {"title": f"{topic} — Part {len(final)}",
+                      "points": [
+                          {"headline": "Core Concept", "detail": f"Important aspect of {topic}. Essential for complete understanding."},
+                          {"headline": "Key Principles", "detail": "Fundamental rules governing this topic."},
+                          {"headline": "Applications", "detail": "Real-world use in systems and products."},
+                          {"headline": "Best Practices", "detail": "Industry-proven guidelines."},
+                          {"headline": "Future Outlook", "detail": "Emerging developments in this area."},
+                      ],
+                      "example":"","practical_example":"","industry_example":"","analogy":"",
+                      "code_example":"","code_language":"","diagram":"",
+                      "image_keyword":"","image_prompt":"","image_suggestion":"",
+                      "speaker_notes":"","professor_text":"",
+                      "quiz_questions":[],"discussion_questions":[],"assignments":[],
+                      "tips":[],"common_mistakes":[]})
+
+    save_version(lecture_id, final)
+    print(f"[GPT-4o] Complete: {len(final)} slides | id={lecture_id}")
+
+    return {
+        "lecture_id": lecture_id,
+        "slides":     final,
+        "metadata": {
+            "topic":      topic,
+            "slide_count":len(final),
+            "model":      GPT_MODEL,
+        },
+    }
+
+
+# ── Chat Edit ─────────────────────────────────────────────────────────────────
+
+def apply_chat_edit(slides: list, instruction: str, topic: str) -> dict:
+    total     = len(slides)
+    slide_map = "\n".join(f"  {i+1}. \"{s.get('title','')}\"" for i,s in enumerate(slides))
+
+    prompt = f"""Edit the university lecture on "{topic}".
+
+Current {total} slides:
+{slide_map}
+
+Instruction: "{instruction}"
+
+Apply exactly. Return the COMPLETE updated lecture.
+Each slide needs: title, points(5 objects:headline+detail), example, practical_example,
+industry_example, analogy, code_example, code_language, diagram, image_keyword,
+image_prompt(DALL-E prompt, NOT filename), speaker_notes, professor_text,
+quiz_questions, discussion_questions, assignments, tips, common_mistakes.
+
+Standards: 5 bullets/slide, 2-sentence details(25-40 words each), real examples with numbers.
+Return ONLY: {{"slides":[...]}}"""
+
+    for attempt in range(3):
+        try:
+            raw    = _call_gpt(prompt, model=GPT_MINI, max_tokens=min(total*400+2000,16000))
+            raw    = _repair_json(raw)
+            parsed = json.loads(raw)
+            new    = parsed.get("slides") or next(
+                (v for v in parsed.values() if isinstance(v,list)),[])
+            if not new: raise ValueError("Empty")
+            cleaned = _clean_slides(new)
+            changed = [i for i in range(min(len(cleaned),len(slides)))
+                       if cleaned[i].get("title")  != slides[i].get("title")
+                       or cleaned[i].get("points") != slides[i].get("points")]
+            changed += list(range(len(slides),len(cleaned)))
+            return {"slides":cleaned,"changed_indices":changed,
+                    "message":f"Done. {len(cleaned)} slides, {len(changed)} updated."}
+        except Exception as e:
+            print(f"[ChatEdit] attempt {attempt+1}: {e}")
+            if attempt < 2: time.sleep(RETRY_DELAYS[attempt])
+
+    return {"slides":slides,"changed_indices":[],
+            "message":"Edit could not be applied. Please try again."}
+
+
+# ── Version History ───────────────────────────────────────────────────────────
+
+def save_version(lecture_id: str, slides: list) -> int:
+    if lecture_id not in _version_store:
+        _version_store[lecture_id] = []
+    _version_store[lecture_id].append(list(slides))
+    return len(_version_store[lecture_id])
+
+def get_versions(lecture_id: str) -> list:
+    return [{"version": i+1, "slide_count": len(v)}
+            for i, v in enumerate(_version_store.get(lecture_id,[]))]
+
+def restore_version(lecture_id: str, version_number: int) -> list:
+    versions = _version_store.get(lecture_id, [])
+    idx = version_number - 1
+    if idx < 0 or idx >= len(versions):
+        raise HTTPException(status_code=404, detail=f"Version {version_number} not found")
+    return versions[idx]

@@ -10,6 +10,10 @@ from difflib import SequenceMatcher
 from typing import List, Optional
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Load .env FIRST before any service imports that read env vars
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException, Depends, Form, File, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,8 +21,9 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from docx import Document
 from groq import Groq
+from typing import List
 
-from database import engine, Base, get_db
+from database import engine, Base, get_db, SessionLocal
 from models import (
     UserDB, CourseDB, StudentDB, PublicationDB, ProjectDB, InterestDB,
     GraduationProjectDB, LiteraturePaperDB,
@@ -34,6 +39,11 @@ from routes import analysis, lecture
 from routes import courses as courses_router
 from file_utils import extract_text
 from services.grading_service import perform_nlp_grading
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
 
 try:
     from services.pptx_service import create_pptx
@@ -59,6 +69,28 @@ UPLOAD_DIR = "uploads/assignments"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 GRAD_DOCS_DIR = "uploads/grad_projects"
 os.makedirs(GRAD_DOCS_DIR, exist_ok=True)
+
+
+@app.on_event("startup")
+def sync_course_student_counts():
+    """Re-sync the cached CourseDB.students column with the live StudentDB count
+    on every startup so stale values from past bugs are corrected immediately."""
+    db = SessionLocal()
+    try:
+        courses = db.query(CourseDB).all()
+        for course in courses:
+            live_count = (
+                db.query(func.count(StudentDB.id))
+                .filter(StudentDB.course_id == course.id)
+                .scalar() or 0
+            )
+            if course.students != live_count:
+                course.students = live_count
+        db.commit()
+    except Exception as e:
+        print(f"[startup] student count sync failed: {e}")
+    finally:
+        db.close()
 
 
 def clean_markdown(text: str) -> str:
@@ -103,7 +135,7 @@ def get_profile(user_id: int, db: Session = Depends(get_db)):
         "bio": user.bio, "department": user.department,
         "metrics": {
             "citations": sum(p.citations for p in pubs),
-            "students": sum(c.students for c in courses),
+            "students": db.query(func.count(StudentDB.id)).filter(StudentDB.course_id.in_([c.id for c in courses])).scalar() or 0,
             "papers": len(pubs),
             "projects": len(grad_projects),
         },
@@ -444,32 +476,68 @@ def get_dashboard_stats(user_id: int, db: Session = Depends(get_db)):
             "active_courses": 0,
         }
 
-    # Total unique students enrolled across all courses (live count, not cached column)
-    total_students = (
+    # ── Total students: union of students table + performance table ──────────
+    # Students can exist in StudentDB (enrolled via roster upload) OR only in
+    # PerformanceDB (grades uploaded directly). Count the union so neither
+    # source is missed.
+    students_enrolled = (
         db.query(func.count(StudentDB.id))
         .filter(StudentDB.course_id.in_(course_ids))
         .scalar() or 0
     )
-
-    graded_subs = (
-        db.query(SubmissionDB)
-        .join(AssignmentDB, SubmissionDB.assignment_id == AssignmentDB.id)
-        .filter(
-            AssignmentDB.course_id.in_(course_ids),
-            SubmissionDB.status == "graded",
-            SubmissionDB.ai_grade.isnot(None),
-        ).all()
+    # PerformanceDB.student_id is a FK to StudentDB, so students there are
+    # always in StudentDB. But count distinct student_ids per course to catch
+    # any orphaned performance records just in case.
+    perf_student_count = (
+        db.query(func.count(func.distinct(PerformanceDB.student_id)))
+        .filter(PerformanceDB.course_id.in_(course_ids))
+        .scalar() or 0
     )
-    grades = [s.ai_grade for s in graded_subs]
-    class_average = round(sum(grades) / len(grades), 1) if grades else 0.0
+    total_students = max(students_enrolled, perf_student_count)
 
-    student_grade_map: dict = {}
-    for s in graded_subs:
-        key = s.student_name or f"sub_{s.id}"
-        student_grade_map.setdefault(key, []).append(s.ai_grade)
-    at_risk_count = sum(
-        1 for g in student_grade_map.values() if sum(g) / len(g) < 60
+    # ── Class average & at-risk: prefer PerformanceDB (actual grades),
+    #    fall back to graded SubmissionDB entries when no performance data exists ──
+
+    perf_records = (
+        db.query(PerformanceDB)
+        .filter(PerformanceDB.course_id.in_(course_ids))
+        .all()
     )
+
+    if perf_records:
+        # Build per-student average from PerformanceDB
+        student_perf: dict = {}
+        for p in perf_records:
+            student_perf.setdefault(p.student_id, []).append(p.grade)
+
+        all_grades = [g for grades in student_perf.values() for g in grades]
+        class_average = round(sum(all_grades) / len(all_grades), 1) if all_grades else 0.0
+
+        at_risk_count = sum(
+            1 for grades in student_perf.values()
+            if (sum(grades) / len(grades)) < 70
+        )
+    else:
+        # Fall back to graded submissions
+        graded_subs = (
+            db.query(SubmissionDB)
+            .join(AssignmentDB, SubmissionDB.assignment_id == AssignmentDB.id)
+            .filter(
+                AssignmentDB.course_id.in_(course_ids),
+                SubmissionDB.status == "graded",
+                SubmissionDB.ai_grade.isnot(None),
+            ).all()
+        )
+        grades = [s.ai_grade for s in graded_subs]
+        class_average = round(sum(grades) / len(grades), 1) if grades else 0.0
+
+        student_grade_map: dict = {}
+        for s in graded_subs:
+            key = s.student_name or f"sub_{s.id}"
+            student_grade_map.setdefault(key, []).append(s.ai_grade)
+        at_risk_count = sum(
+            1 for g in student_grade_map.values() if sum(g) / len(g) < 70
+        )
 
     pending_grading = (
         db.query(SubmissionDB)
@@ -481,13 +549,13 @@ def get_dashboard_stats(user_id: int, db: Session = Depends(get_db)):
     )
 
     return {
-        "class_average":  class_average,
-        "average_trend":  0.0,
-        "at_risk_count":  at_risk_count,
+        "class_average":   class_average,
+        "average_trend":   0.0,
+        "at_risk_count":   at_risk_count,
         "pending_grading": pending_grading,
-        "total_students": total_students,
-        "total_courses":  len(courses),
-        "active_courses": len(active_course_ids),
+        "total_students":  total_students,
+        "total_courses":   len(courses),
+        "active_courses":  len(active_course_ids),
     }
 
 
@@ -1113,6 +1181,144 @@ async def grade_student(
         "plagiarism_matches": plagiarism_matches
     }
 
+async def process_multiple_files(
+    assignment_id: int,
+    files_data: List[tuple],   # each tuple: (filename: str, content: bytes)
+    feedback_tone: str,
+    db: Session
+) -> List[dict]:
+    """
+    Process a list of (filename, bytes) and return a list of result dicts.
+    Does NOT save submissions – returns results for the caller to handle.
+    """
+    assign = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
+    if not assign:
+        raise HTTPException(404, "Assignment not found")
+    if feedback_tone not in {"formal", "encouraging", "strict"}:
+        feedback_tone = "formal"
+
+    results = []
+    for filename, content in files_data:
+        try:
+            # Write to temp file to reuse extract_text
+            ext = filename.split('.')[-1].lower()
+            temp_path = f"temp_{uuid.uuid4()}.{ext}"
+            with open(temp_path, "wb") as f:
+                f.write(content)
+            try:
+                student_text = extract_text(temp_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+            # Build reference
+            if assign.is_model_answer:
+                mode = "MODEL"
+                reference = f"### MODE: MODEL_ANSWER\nQUESTION:\n{assign.assignment_question}\n\nIDEAL ANSWER:\n{assign.model_answer}"
+            else:
+                mode = "RUBRIC"
+                reference = f"### MODE: RUBRIC\nQUESTION:\n{assign.assignment_question}\n\nRUBRIC:\n{assign.rubric}"
+
+            # AI grading
+            ai_report = perform_nlp_grading(
+                student_text=student_text,
+                mode=mode,
+                reference=reference,
+                feedback_tone=feedback_tone,
+            )
+
+            # Plagiarism check (against existing DB)
+            course = db.query(CourseDB).filter(CourseDB.id == assign.course_id).first()
+            owner_id = course.user_id if course else 1
+            plagiarism_result = await check_plagiarism_ai_direct(
+                student_text=student_text,
+                user_id=owner_id,
+                db=db
+            )
+            plagiarism_score = plagiarism_result.get("plagiarism_score", 0)
+            plagiarism_matches = plagiarism_result.get("matches", [])
+            ai_report["plagiarism"] = plagiarism_score
+            ai_report["plagiarism_matches"] = plagiarism_matches
+
+            results.append({
+                "filename": filename,
+                "student_name": filename.split('.')[0],
+                "student_text": student_text,
+                "ai_grade": ai_report.get("score_out_of_100", 0),
+                "plagiarism_score": plagiarism_score,
+                "grade_report": ai_report,
+                "success": True,
+            })
+        except Exception as e:
+            results.append({
+                "filename": filename,
+                "success": False,
+                "error": str(e),
+            })
+    return results
+
+@app.post("/grade-submission-batch/{assignment_id}")
+async def grade_submission_batch(
+    assignment_id: int,
+    files: List[UploadFile] = File(...),
+    feedback_tone: str = Form("formal"),
+    db: Session = Depends(get_db)
+):
+    # Read all files into memory
+    files_data = []
+    for f in files:
+        content = await f.read()
+        files_data.append((f.filename, content))
+
+    results = await process_multiple_files(assignment_id, files_data, feedback_tone, db)
+
+    # Save successful submissions
+    assign = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
+    submissions_to_add = []
+    for r in results:
+        if r["success"]:
+            sub = SubmissionDB(
+                assignment_id=assignment_id,
+                student_name=r["student_name"],
+                status="ready",
+                ai_grade=r["ai_grade"],
+                plagiarism_score=r["plagiarism_score"],
+                grade_report=r["grade_report"],
+                essay_content=r["student_text"],
+            )
+            submissions_to_add.append(sub)
+            db.add(sub)
+
+    db.flush()  # get IDs for error analysis
+
+    # Add error analysis entries (same as single grading)
+    category_label_map = {
+        "conceptual": "Conceptual", "structural": "Structural",
+        "language": "Language", "completeness": "Completeness",
+    }
+    for sub in submissions_to_add:
+        student_record = db.query(StudentDB).filter(
+            StudentDB.name == sub.student_name,
+            StudentDB.course_id == assign.course_id
+        ).first()
+        for key, description in (sub.grade_report.get("error_categories") or {}).items():
+            if not description or str(description).strip().lower() in ("null", "none", ""):
+                continue
+            db.add(ErrorAnalysisDB(
+                student_id=student_record.id if student_record else None,
+                course_id=assign.course_id,
+                assignment_name=assign.assignment_name,
+                error_category=category_label_map.get(key, key.capitalize()),
+                error_type=str(description)[:500],
+            ))
+
+    db.commit()
+
+    # Return summary
+    return {"results": [
+        {"filename": r["filename"], "success": r["success"], "grade": r.get("ai_grade"), "error": r.get("error")}
+        for r in results
+    ]}
 
 @app.post("/analyze-general-submission")
 async def analyze_general(data: dict, user_id: int, db: Session = Depends(get_db)):
@@ -1148,6 +1354,83 @@ async def analyze_general(data: dict, user_id: int, db: Session = Depends(get_db
         print(f"AI Service Error: {e}")
         raise HTTPException(status_code=500, detail=f"AI grading failed: {str(e)}")
 
+@app.post("/analyze-general-batch")
+async def analyze_general_batch(
+    user_id: int = Form(...),
+    mode: str = Form(...),
+    reference_content: str = Form(...),
+    feedback_tone: str = Form("formal"),
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db)
+):
+    if feedback_tone not in {"formal", "encouraging", "strict"}:
+        feedback_tone = "formal"
+
+    results = []
+    for file in files:
+        try:
+            # 1. Extract text from the uploaded file
+            content = await file.read()
+            ext = file.filename.split('.')[-1].lower()
+            temp_path = f"temp_{uuid.uuid4()}.{ext}"
+            with open(temp_path, "wb") as f:
+                f.write(content)
+            try:
+                student_text = extract_text(temp_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+            # 2. Run AI grading (same as single)
+            ai_report = perform_nlp_grading(
+                student_text=student_text,
+                mode=mode,
+                reference=reference_content,
+                feedback_tone=feedback_tone,
+            )
+
+            # 3. Plagiarism check
+            plagiarism_result = await check_plagiarism_ai_direct(
+                student_text=student_text,
+                user_id=user_id,
+                db=db
+            )
+            plagiarism_score = plagiarism_result.get("plagiarism_score", 0)
+            plagiarism_matches = plagiarism_result.get("matches", [])
+            ai_report["plagiarism"] = plagiarism_score
+            ai_report["plagiarism_matches"] = plagiarism_matches
+
+            # 4. Save submission (no assignment_id → general)
+            new_sub = SubmissionDB(
+                student_name=file.filename.split('.')[0],
+                essay_content=student_text,
+                ai_grade=ai_report.get("score_out_of_100", 0),
+                plagiarism_score=plagiarism_score,
+                grade_report=ai_report,
+                status="ready",
+                user_id=user_id,
+                assignment_id=None
+            )
+            db.add(new_sub)
+            db.flush()
+
+            results.append({
+                "filename": file.filename,
+                "success": True,
+                "id": new_sub.id,
+                "ai_grade": new_sub.ai_grade,
+                "plagiarism_score": plagiarism_score,
+                "report": ai_report,
+                "student_name": new_sub.student_name,
+            })
+        except Exception as e:
+            results.append({
+                "filename": file.filename,
+                "success": False,
+                "error": str(e),
+            })
+    db.commit()
+    return {"results": results}
 
 @app.post("/submissions/general")
 async def create_general_submission(data: dict, db: Session = Depends(get_db)):
@@ -1206,7 +1489,6 @@ async def update_grade(submission_id: int, data: dict, db: Session = Depends(get
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
 
-    # Clean parameter fallbacks to parse final structural assignments safely
     submission.manual_grade = int(data.get('final_grade', data.get('ai_grade', 0)))
     submission.status = data.get('status', 'graded')
 
@@ -1260,6 +1542,164 @@ async def get_submission_details(submission_id: int, db: Session = Depends(get_d
             "detected_language": "English"
         }
     }
+
+@app.get("/export-grades-excel/{assignment_id}")
+async def export_grades_excel(assignment_id: int, db: Session = Depends(get_db)):
+    assignment = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
+    if not assignment:
+        raise HTTPException(404, "Assignment not found")
+    submissions = db.query(SubmissionDB).filter(SubmissionDB.assignment_id == assignment_id).all()
+    data = []
+    for sub in submissions:
+        data.append({
+            "Student Name": sub.student_name,
+            "AI Grade": sub.ai_grade,
+            "Manual Grade": sub.manual_grade,
+            "Final Grade": sub.manual_grade if sub.manual_grade is not None else sub.ai_grade,
+            "Plagiarism Score": sub.plagiarism_score,
+            "Submission Date": sub.submission_time.strftime("%Y-%m-%d %H:%M") if sub.submission_time else "",
+            "Status": sub.status,
+        })
+    df = pd.DataFrame(data)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name="Grades", index=False)
+    output.seek(0)
+    filename = f"grades_{assignment.assignment_name}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+# ──  exporting assignment grades  ────────────────────────────────────────────────────────
+@app.get("/export-grades-pdf/{assignment_id}")
+async def export_grades_pdf(assignment_id: int, db: Session = Depends(get_db)):
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    assignment = db.query(AssignmentDB).filter(AssignmentDB.id == assignment_id).first()
+    if not assignment:
+        raise HTTPException(404, "Assignment not found")
+    submissions = db.query(SubmissionDB).filter(SubmissionDB.assignment_id == assignment_id).all()
+    data = [["Student Name", "AI Grade", "Manual Grade", "Final Grade", "Plagiarism", "Submission Date", "Status"]]
+    for sub in submissions:
+        final_grade = sub.manual_grade if sub.manual_grade is not None else sub.ai_grade
+        data.append([
+            sub.student_name or "",
+            str(sub.ai_grade) if sub.ai_grade is not None else "",
+            str(sub.manual_grade) if sub.manual_grade is not None else "",
+            str(final_grade) if final_grade is not None else "",
+            str(sub.plagiarism_score) if sub.plagiarism_score is not None else "",
+            sub.submission_time.strftime("%Y-%m-%d %H:%M") if sub.submission_time else "",
+            sub.status or "",
+        ])
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+    styles = getSampleStyleSheet()
+    title_style = styles['Title']
+    title = Paragraph(f"Grades for Assignment: {assignment.assignment_name}", title_style)
+
+    table = Table(data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,0), 10),
+        ('BOTTOMPADDING', (0,0), (-1,0), 8),
+        ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+    ]))
+    elements = [title, Spacer(1, 0.2*inch), table]
+    doc.build(elements)
+    buffer.seek(0)
+    filename = f"grades_{assignment.assignment_name}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+# ── exporting grades of general grading ────────────────────────────────────────────────────────
+@app.get("/export-general-excel/{user_id}")
+async def export_general_excel(user_id: int, db: Session = Depends(get_db)):
+    submissions = db.query(SubmissionDB).filter(
+        SubmissionDB.user_id == user_id,
+        SubmissionDB.assignment_id == None
+    ).all()
+
+    data = []
+    for sub in submissions:
+        final_grade = sub.manual_grade if sub.manual_grade is not None else sub.ai_grade
+        data.append({
+            "Student Name": sub.student_name or "",
+            "AI Grade": sub.ai_grade,
+            "Manual Grade": sub.manual_grade,
+            "Final Grade": final_grade,
+            "Plagiarism Score": sub.plagiarism_score,
+            "Submission Date": sub.submission_time.strftime("%Y-%m-%d %H:%M") if sub.submission_time else "",
+            "Status": sub.status or "",
+        })
+    df = pd.DataFrame(data)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name="Grades", index=False)
+    output.seek(0)
+    filename = f"general_grades_user_{user_id}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+@app.get("/export-general-pdf/{user_id}")
+async def export_general_pdf(user_id: int, db: Session = Depends(get_db)):
+    submissions = db.query(SubmissionDB).filter(
+        SubmissionDB.user_id == user_id,
+        SubmissionDB.assignment_id == None
+    ).all()
+
+    table_data = [["Student Name", "AI Grade", "Manual Grade", "Final Grade", "Plagiarism", "Submission Date", "Status"]]
+    for sub in submissions:
+        final_grade = sub.manual_grade if sub.manual_grade is not None else sub.ai_grade
+        table_data.append([
+            sub.student_name or "",
+            str(sub.ai_grade) if sub.ai_grade is not None else "",
+            str(sub.manual_grade) if sub.manual_grade is not None else "",
+            str(final_grade) if final_grade is not None else "",
+            str(sub.plagiarism_score) if sub.plagiarism_score is not None else "",
+            sub.submission_time.strftime("%Y-%m-%d %H:%M") if sub.submission_time else "",
+            sub.status or "",
+        ])
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+    styles = getSampleStyleSheet()
+    title = Paragraph(f"General Grades (User {user_id})", styles['Title'])
+
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,0), 10),
+        ('BOTTOMPADDING', (0,0), (-1,0), 8),
+        ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+    ]))
+
+    elements = [title, Spacer(1, 0.2*inch), table]
+    doc.build(elements)
+    buffer.seek(0)
+
+    filename = f"general_grades_user_{user_id}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 # ── Performance Upload ────────────────────────────────────────────────────────
 

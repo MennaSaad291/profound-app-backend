@@ -122,10 +122,10 @@ def delete_student(course_id: int, student_id: int, db: Session = Depends(get_db
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
     db.delete(student)
+    db.flush()  # ensure delete is visible to COUNT
     course = db.query(CourseDB).filter(CourseDB.id == course_id).first()
     if course:
-        count = db.query(func.count(StudentDB.id)).filter(StudentDB.course_id == course_id).scalar()
-        course.students = max(0, count - 1)
+        course.students = db.query(func.count(StudentDB.id)).filter(StudentDB.course_id == course_id).scalar()
     db.commit()
     return {"message": "Student removed"}
 
