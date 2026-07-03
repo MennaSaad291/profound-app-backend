@@ -598,18 +598,20 @@ def create_pptx(data: dict) -> io.BytesIO:
     prs.slide_width  = _W
     prs.slide_height = _H
 
+
+    first_sd = slides_data[0] if slides_data and isinstance(slides_data[0], dict) else {}
+    cover_slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank layout
+    _title_slide(
+        cover_slide, c,
+        _clean(first_sd.get("title", "Lecture")),
+        "",  # speaker notes belong to the real slide 1, not the cover
+    )
+
     for idx, sd in enumerate(slides_data):
         if not isinstance(sd, dict):
             continue
         slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank layout
-        if idx == 0:
-            _title_slide(
-                slide, c,
-                _clean(sd.get("title", "Lecture")),
-                _clean(sd.get("speaker_notes", "")),
-            )
-        else:
-            _content_slide(slide, c, idx + 1, sd)
+        _content_slide(slide, c, idx + 1, sd)
 
     buf = io.BytesIO()
     prs.save(buf)
