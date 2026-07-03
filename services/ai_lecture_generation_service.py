@@ -543,6 +543,19 @@ Return ONLY: {{"slides":[...]}}"""
                        if cleaned[i].get("title")  != slides[i].get("title")
                        or cleaned[i].get("points") != slides[i].get("points")]
             changed += list(range(len(slides),len(cleaned)))
+            changed_set = set(changed)
+            # For slides the edit didn't actually touch, the model still
+            # tends to re-word image_prompt/image_keyword even though the
+            # content is unchanged. That drift breaks the DALL-E cache key
+            # (both the frontend's and _dalle_cache's), causing every chat
+            # edit to silently re-generate (and re-bill) images for the
+            # whole deck instead of just the edited slide. Keep the
+            # original image fields for untouched slides so the cache key
+            # stays stable.
+            for i in range(min(len(cleaned), len(slides))):
+                if i not in changed_set:
+                    cleaned[i]["image_prompt"]  = slides[i].get("image_prompt", "")
+                    cleaned[i]["image_keyword"] = slides[i].get("image_keyword", "")
             return {"slides":cleaned,"changed_indices":changed,
                     "message":f"Done. {len(cleaned)} slides, {len(changed)} updated."}
         except Exception as e:

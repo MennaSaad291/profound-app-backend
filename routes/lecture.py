@@ -199,6 +199,7 @@ async def generate_slide_image(data: dict):
     """
     import requests as _req
     from openai import OpenAI
+    from fastapi.concurrency import run_in_threadpool
 
     prompt = str(data.get("image_prompt") or data.get("prompt") or "").strip()
     if not prompt:
@@ -215,10 +216,23 @@ async def generate_slide_image(data: dict):
 
     try:
         client = OpenAI(api_key=openai_key)
-        resp = client.images.generate(
-            model="gpt-image-1",    # newer model available on this account
+        # IMPORTANT: client.images.generate() is a *blocking* synchronous call.
+        # Running it directly inside this `async def` route freezes FastAPI's
+        # single event loop for the whole call, so "parallel" requests from the
+        # frontend actually get processed one-by-one on the server, and later
+        # ones blow past the client's 45s timeout. run_in_threadpool offloads
+        # the blocking call to a worker thread so multiple images really do
+        # generate concurrently.
+        resp = await run_in_threadpool(
+            client.images.generate,
+            model="gpt-image-1",
             prompt=prompt,
             size="1024x1024",
+            quality="medium",  # "auto"/unset silently picks "high" ($0.167/img,
+                                # ~4x medium's $0.042 and ~15x low's $0.011) for
+                                # most prompts — medium is plenty for slide art
+                                # and was the main driver of unexpectedly fast
+                                # credit burn.
             n=1,
         )
         img_data = resp.data[0]
@@ -228,7 +242,7 @@ async def generate_slide_image(data: dict):
             import base64 as _b64
             img_bytes = _b64.b64decode(img_data.b64_json)
         elif hasattr(img_data, 'url') and img_data.url:
-            img_resp = _req.get(img_data.url, timeout=15)
+            img_resp = await run_in_threadpool(_req.get, img_data.url, timeout=15)
             if img_resp.status_code != 200:
                 raise HTTPException(status_code=502, detail="Failed to download image")
             img_bytes = img_resp.content
