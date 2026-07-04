@@ -270,7 +270,13 @@ def get_prediction(
         user_id=user_id
     )
 
-    weekly_data = query.group_by("week_start").order_by("week_start").all()
+    weekly_data = []
+    try:
+        weekly_data = query.group_by("week_start").order_by("week_start").all()
+    except Exception as e:
+        # date_trunc is Postgres-only; gracefully return empty on SQLite or unsupported DB
+        print(f"[prediction] date_trunc not supported: {e}")
+        return {"chart": [], "message": "Prediction requires PostgreSQL (date_trunc not available)"}
 
     if len(weekly_data) < 3:
         return {"chart": [], "message": "Need at least 3 weeks"}
