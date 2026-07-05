@@ -87,6 +87,7 @@ class LectureChatEditRequest(BaseModel):
     slides: list
     instruction: str
     topic: str
+    current_slide_index: Optional[int] = None  # 0-based index of the slide the user is viewing
 
 
 class LectureVersionRestoreRequest(BaseModel):

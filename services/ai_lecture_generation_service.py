@@ -510,54 +510,113 @@ def generate_lecture_json(data) -> dict:
 
 # ── Chat Edit ─────────────────────────────────────────────────────────────────
 
-def apply_chat_edit(slides: list, instruction: str, topic: str) -> dict:
-    total     = len(slides)
-    slide_map = "\n".join(f"  {i+1}. \"{s.get('title','')}\"" for i,s in enumerate(slides))
+_ALL_SLIDES_PHRASES = (
+    "all slides", "every slide", "each slide", "entire lecture",
+    "whole lecture", "whole deck", "throughout the lecture", "throughout",
+)
 
-    prompt = f"""Edit the university lecture on "{topic}".
+def _extract_target_indices(instruction: str, total: int, current_index: int | None) -> list[int]:
+    """Figure out which slide(s) an instruction is actually scoped to, instead of
+    assuming the whole deck. Returns a sorted list of 0-based indices."""
+    instr = instruction.lower()
 
-Current {total} slides:
-{slide_map}
+    if any(p in instr for p in _ALL_SLIDES_PHRASES):
+        return list(range(total))
+
+    nums: set[int] = set()
+
+    # Ranges: "slides 3-5", "slide 3 to 5"
+    for m in re.finditer(r"slides?\s+(\d+)\s*(?:-|to)\s*(\d+)", instr):
+        a, b = int(m.group(1)), int(m.group(2))
+        nums.update(range(min(a, b), max(a, b) + 1))
+
+    # Strip matched ranges so they aren't re-parsed as loose numbers below
+    stripped = re.sub(r"slides?\s+\d+\s*(?:-|to)\s*\d+", " ", instr)
+
+    # Lists / singles: "slide 9", "slides 4 and 6", "slides 3, 5, 7"
+    for m in re.finditer(r"slides?\s+((?:\d+\s*(?:,|and|&)?\s*)+)", stripped):
+        nums.update(int(n) for n in re.findall(r"\d+", m.group(1)))
+
+    valid = sorted(i - 1 for i in nums if 1 <= i <= total)
+    if valid:
+        return valid
+
+    # No explicit slide reference in the instruction (e.g. "add quiz questions").
+    # Scope it to whatever slide the professor is currently looking at, rather
+    # than silently touching the whole deck.
+    if current_index is not None and 0 <= current_index < total:
+        return [current_index]
+
+    # Last resort — genuinely ambiguous and no current slide context supplied.
+    return list(range(total))
+
+
+def apply_chat_edit(slides: list, instruction: str, topic: str,
+                     current_index: int | None = None) -> dict:
+    total   = len(slides)
+    targets = _extract_target_indices(instruction, total, current_index)
+
+    # Only send the targeted slide(s) to the model — this is what keeps every
+    # other slide byte-for-byte identical (title, points, image fields, etc.)
+    # instead of relying on a fragile text-diff to guess what "changed".
+    payload = [{"index": i + 1, "slide": slides[i]} for i in targets]
+
+    prompt = f"""Edit these specific slides from a university lecture on "{topic}".
 
 Instruction: "{instruction}"
 
-Apply exactly. Return the COMPLETE updated lecture.
+Slides to edit (JSON, 1-based index matches their position in the full deck):
+{json.dumps(payload, ensure_ascii=False)}
+
+Apply the instruction ONLY to these slides. Do not invent edits beyond what was asked.
+If the instruction asks to split one slide into multiple, return multiple slide
+objects for that index, in order.
+
 Each slide needs: title, points(5 objects:headline+detail), example, practical_example,
 industry_example, analogy, code_example, code_language, diagram, image_keyword,
 image_prompt(DALL-E prompt, NOT filename), speaker_notes, professor_text,
 quiz_questions, discussion_questions, assignments, tips, common_mistakes.
 
-Standards: 5 bullets/slide, 2-sentence details(25-40 words each), real examples with numbers.
-Return ONLY: {{"slides":[...]}}"""
+Return ONLY: {{"edits":[{{"index":<original 1-based index>,"slides":[<one or more slide objects>]}}]}}"""
 
     for attempt in range(3):
         try:
-            raw    = _call_gpt(prompt, model=GPT_MINI, max_tokens=min(total*400+2000,16000))
+            raw    = _call_gpt(prompt, model=GPT_MINI,
+                                max_tokens=min(len(targets) * 500 + 1500, 16000))
             raw    = _repair_json(raw)
             parsed = json.loads(raw)
-            new    = parsed.get("slides") or next(
-                (v for v in parsed.values() if isinstance(v,list)),[])
-            if not new: raise ValueError("Empty")
-            cleaned = _clean_slides(new)
-            changed = [i for i in range(min(len(cleaned),len(slides)))
-                       if cleaned[i].get("title")  != slides[i].get("title")
-                       or cleaned[i].get("points") != slides[i].get("points")]
-            changed += list(range(len(slides),len(cleaned)))
-            changed_set = set(changed)
-            # For slides the edit didn't actually touch, the model still
-            # tends to re-word image_prompt/image_keyword even though the
-            # content is unchanged. That drift breaks the DALL-E cache key
-            # (both the frontend's and _dalle_cache's), causing every chat
-            # edit to silently re-generate (and re-bill) images for the
-            # whole deck instead of just the edited slide. Keep the
-            # original image fields for untouched slides so the cache key
-            # stays stable.
-            for i in range(min(len(cleaned), len(slides))):
-                if i not in changed_set:
-                    cleaned[i]["image_prompt"]  = slides[i].get("image_prompt", "")
-                    cleaned[i]["image_keyword"] = slides[i].get("image_keyword", "")
-            return {"slides":cleaned,"changed_indices":changed,
-                    "message":f"Done. {len(cleaned)} slides, {len(changed)} updated."}
+            edits  = parsed.get("edits") or next(
+                (v for v in parsed.values() if isinstance(v, list)), [])
+            if not edits: raise ValueError("Empty")
+
+            edit_map: dict[int, list] = {}
+            for e in edits:
+                idx = e.get("index")
+                sl  = e.get("slides")
+                if isinstance(idx, int) and isinstance(sl, list) and sl:
+                    edit_map[idx - 1] = _clean_slides(sl)
+
+            if not edit_map: raise ValueError("No usable edits returned")
+
+            # Rebuild the deck: untouched slides are copied through completely
+            # unchanged (no drift on titles, points, image_prompt, etc.);
+            # targeted slides are replaced (and may expand into several).
+            new_slides: list = []
+            changed: list[int] = []
+            for i, original in enumerate(slides):
+                if i in edit_map:
+                    start = len(new_slides)
+                    new_slides.extend(edit_map[i])
+                    changed.extend(range(start, len(new_slides)))
+                else:
+                    new_slides.append(original)
+
+            label = ", ".join(str(i + 1) for i in targets)
+            return {
+                "slides": new_slides,
+                "changed_indices": changed,
+                "message": f"Done. Updated slide(s) {label} ({len(changed)} slide(s) affected).",
+            }
         except Exception as e:
             print(f"[ChatEdit] attempt {attempt+1}: {e}")
             if attempt < 2: time.sleep(RETRY_DELAYS[attempt])

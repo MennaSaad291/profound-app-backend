@@ -1469,6 +1469,7 @@ async def analyze_general_batch(
                 "plagiarism_score": plagiarism_score,
                 "report": ai_report,
                 "student_name": new_sub.student_name,
+                "essay_content": student_text,
             })
         except Exception as e:
             results.append({
@@ -1844,7 +1845,7 @@ async def export_general_pdf(user_id: int, db: Session = Depends(get_db)):
     )
 
     elements = [
-        Paragraph(f"General Grades Report — User {user_id}", title_style),
+        Paragraph("General Grades Report", title_style),
         Spacer(1, 0.15 * inch),
     ]
 

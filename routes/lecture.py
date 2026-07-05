@@ -44,7 +44,8 @@ async def generate_lecture(data: LectureRequest):
 
 @router.post("/lecture/chat-edit")
 async def chat_edit_lecture(data: LectureChatEditRequest):
-    result         = apply_chat_edit(data.slides, data.instruction, data.topic)
+    result         = apply_chat_edit(data.slides, data.instruction, data.topic,
+                                      current_index=data.current_slide_index)
     updated_slides = result["slides"]
     changed        = result["changed_indices"]
     version_num    = save_version(data.lecture_id, updated_slides)
