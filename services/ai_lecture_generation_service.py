@@ -184,10 +184,49 @@ def _clean_slides(raw_list: list) -> list:
     return out
 
 
+# ── Reference summariser ─────────────────────────────────────────────────────
+
+def _summarise_reference(ref: str, topic: str) -> str:
+    """
+    Condense an arbitrarily long reference into a compact ~800-char summary
+    using gpt-4o-mini (very cheap).  The summary is generated ONCE and reused
+    by every batch, so the total token cost is:
+        1 mini call  +  N batch calls each carrying ~200 tokens of summary
+    instead of the old approach of embedding raw text chunks in every batch.
+    """
+    # If the reference is already short there is nothing to save — use it as-is.
+    if len(ref) <= 900:
+        return ref.strip()
+
+    prompt = (
+        f'Summarise the following reference material for a university lecture on "{topic}".\n'
+        f'Output a single dense paragraph (max 150 words) that captures:\n'
+        f'- The main topics, definitions, and key facts\n'
+        f'- Any specific terminology, figures, or examples worth preserving\n'
+        f'- The overall scope and depth of the material\n\n'
+        f'Reference:\n{ref[:12000]}\n\n'   # cap at 12k chars ≈ ~3k tokens input
+        f'Summary (plain text, no bullet points, no markdown):'
+    )
+    try:
+        # Use a plain text response (no json_object format needed here)
+        resp = _get_client().chat.completions.create(
+            model=GPT_MINI,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=200,   # ~150 words output
+        )
+        summary = resp.choices[0].message.content.strip()
+        print(f"[Ref] Summarised {len(ref)} chars → {len(summary)} chars")
+        return summary
+    except Exception as e:
+        print(f"[Ref] Summarisation failed ({e}), falling back to first 900 chars")
+        return ref[:900].strip()
+
+
 # ── Slide batch prompt ────────────────────────────────────────────────────────
 
 def _batch_prompt(topic: str, batch_titles: list, covered_titles: list,
-                  prof_note: str, ref: str, is_last_batch: bool) -> str:
+                  prof_note: str, ref_summary: str, is_last_batch: bool) -> str:
     covered_block = ""
     if covered_titles:
         covered_block = f"\nAlready covered in previous slides (DO NOT REPEAT): {json.dumps(covered_titles)}\n"
@@ -204,7 +243,7 @@ The last two slides in this batch MUST be:
     slides_to_make = "\n".join(f"  - {t}" for t in batch_titles)
 
     custom = f"\nProfessor instructions (MANDATORY): {prof_note}\n" if prof_note.strip() else ""
-    ref_block = f"\nReference material: {ref[:600]}\n" if ref else ""
+    ref_block = f"\nReference material (base slide content on this):\n{ref_summary}\n" if ref_summary else ""
 
     return f"""You are creating university lecture slides on "{topic}".
 {custom}{ref_block}{covered_block}{last_note}
@@ -399,12 +438,18 @@ def generate_lecture_json(data) -> dict:
     all_slides   = []
     covered_list = []
 
+    # Summarise the reference ONCE with gpt-4o-mini, then reuse that compact
+    # summary in every batch prompt.  This gives all batches full awareness of
+    # the reference content at a fraction of the token cost of injecting raw
+    # text into each call.
+    ref_summary = _summarise_reference(ref, topic) if ref else ""
+
     for batch_idx, batch_titles in enumerate(batches):
         is_last = (batch_idx == len(batches) - 1)
         print(f"[GPT-4o] Batch {batch_idx+1}/{len(batches)}: {batch_titles}")
 
         prompt = _batch_prompt(topic, batch_titles, covered_list,
-                               prof_note, ref, is_last_batch=is_last)
+                               prof_note, ref_summary, is_last_batch=is_last)
 
         batch_slides = None
         for attempt in range(4):
@@ -541,13 +586,10 @@ def _extract_target_indices(instruction: str, total: int, current_index: int | N
     if valid:
         return valid
 
-    # No explicit slide reference in the instruction (e.g. "add quiz questions").
-    # Scope it to whatever slide the professor is currently looking at, rather
-    # than silently touching the whole deck.
+
     if current_index is not None and 0 <= current_index < total:
         return [current_index]
 
-    # Last resort — genuinely ambiguous and no current slide context supplied.
     return list(range(total))
 
 
@@ -556,9 +598,6 @@ def apply_chat_edit(slides: list, instruction: str, topic: str,
     total   = len(slides)
     targets = _extract_target_indices(instruction, total, current_index)
 
-    # Only send the targeted slide(s) to the model — this is what keeps every
-    # other slide byte-for-byte identical (title, points, image fields, etc.)
-    # instead of relying on a fragile text-diff to guess what "changed".
     payload = [{"index": i + 1, "slide": slides[i]} for i in targets]
 
     prompt = f"""Edit these specific slides from a university lecture on "{topic}".
@@ -598,9 +637,7 @@ Return ONLY: {{"edits":[{{"index":<original 1-based index>,"slides":[<one or mor
 
             if not edit_map: raise ValueError("No usable edits returned")
 
-            # Rebuild the deck: untouched slides are copied through completely
-            # unchanged (no drift on titles, points, image_prompt, etc.);
-            # targeted slides are replaced (and may expand into several).
+
             new_slides: list = []
             changed: list[int] = []
             for i, original in enumerate(slides):
