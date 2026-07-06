@@ -101,10 +101,11 @@ def at_risk(
     course_id: int = None,
     semester: str = None,
     days: int = None,
+    user_id: int = None,
     db: Session = Depends(get_db)
 ):
     return analytics_service.get_at_risk_students(
-        db, course_id=course_id, semester=semester
+        db, course_id=course_id, semester=semester, user_id=user_id
     )
 
 @router.get("/courses")

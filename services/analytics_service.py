@@ -121,33 +121,50 @@ def _latest_week_bounds(db, course_id=None, semester=None, user_id=None):
     return week_start, week_end
 
 
-def get_performance_distribution(db, course_id=None, semester=None, days=None, from_date=None, to_date=None, user_id=None):
-    """Always shows the grade breakdown for the LATEST week in the DB,
-    regardless of the days/from_date/to_date filter passed by the caller."""
-
-    week_start, week_end = _latest_week_bounds(db, course_id=course_id, semester=semester, user_id=user_id)
-
-    query = db.query(PerformanceDB.grade)
-
-    if user_id and not course_id:
-        query = query.join(CourseDB, CourseDB.id == PerformanceDB.course_id)
-        query = query.filter(CourseDB.user_id == user_id)
-
+def _course_ids_in_scope(db, course_id=None, semester=None, user_id=None):
     if course_id:
-        query = query.filter(PerformanceDB.course_id == course_id)
-
+        return [course_id]
+    query = db.query(CourseDB.id)
+    if user_id:
+        query = query.filter(CourseDB.user_id == user_id)
     if semester and semester.strip() and semester != "All Semesters":
-        if not (user_id and not course_id):   # avoid double join
-            query = query.join(CourseDB, CourseDB.id == PerformanceDB.course_id)
         query = query.filter(CourseDB.semester == semester.strip())
+    return [row[0] for row in query.all()]
 
-    if week_start is not None:
-        query = query.filter(
-            PerformanceDB.created_at >= week_start,
-            PerformanceDB.created_at < week_end,
+
+def _grades_for_latest_week(db, course_id=None, semester=None, user_id=None):
+    """
+    Return grades from the latest week. For a single course, that course's
+    latest week. For all courses, combine each course's own latest week.
+    """
+    grades = []
+    for cid in _course_ids_in_scope(db, course_id=course_id, semester=semester, user_id=user_id):
+        week_start, week_end = _latest_week_bounds(
+            db, course_id=cid, semester=semester, user_id=user_id
         )
+        if week_start is None:
+            continue
+        rows = (
+            db.query(PerformanceDB.grade)
+            .filter(
+                PerformanceDB.course_id == cid,
+                PerformanceDB.created_at >= week_start,
+                PerformanceDB.created_at < week_end,
+            )
+            .all()
+        )
+        grades.extend(g[0] for g in rows)
+    return grades
 
-    grades = [g[0] for g in query.all()]
+
+def get_performance_distribution(db, course_id=None, semester=None, days=None, from_date=None, to_date=None, user_id=None):
+    """Always shows the grade breakdown for the latest week.
+    Single course: that course's latest week.
+    All courses: combined grades from each course's own latest week."""
+
+    grades = _grades_for_latest_week(
+        db, course_id=course_id, semester=semester, user_id=user_id
+    )
 
     dist = {
         "Excellent (90-100)": 0,
@@ -478,11 +495,31 @@ def department_benchmarks(
     from_date=None,
     to_date=None
 ):
+    if not course_id:
+        return {
+            "benchmarks": [],
+            "message": "Select a course to view department benchmarks.",
+        }
 
     course = db.query(CourseDB).filter(CourseDB.id == course_id).first()
 
     if not course:
-        return []
+        return {
+            "benchmarks": [],
+            "message": "Course not found.",
+        }
+
+    if semester and semester.strip() and semester != "All Semesters":
+        course_semester = (course.semester or "").strip()
+        selected_semester = semester.strip()
+        if course_semester and course_semester != selected_semester:
+            return {
+                "benchmarks": [],
+                "message": (
+                    f"This course is not offered in {selected_semester}. "
+                    f"It belongs to {course_semester}."
+                ),
+            }
 
     department = course.department
 
@@ -604,7 +641,7 @@ def department_benchmarks(
             }
             
         ]
-    return benchmarks_list
+    return {"benchmarks": benchmarks_list, "message": None}
 
 def create_grade_chart(perf_data):
 
@@ -670,130 +707,86 @@ def create_scatter_chart(points):
     plt.savefig(path)
     plt.close()
     return path
-def get_at_risk_students(
+def _at_risk_students_for_course_week(
     db,
-    course_id=None,
-    semester=None,
-    department_id=None
+    course_id,
+    week_start,
+    week_end,
+    department_id=None,
 ):
-    """
-    Return at-risk students based ONLY on their most recent week's record.
-    'Most recent week' = the latest calendar week (date_trunc) that has
-    any performance data, so uploading a new week automatically replaces
-    the previous week's at-risk list.
-    """
-
-    week_start, week_end = _latest_week_bounds(db, course_id=course_id, semester=semester)
-
     query = db.query(
         StudentDB.student_id.label("student_id"),
         StudentDB.name.label("student_name"),
         PerformanceDB.grade,
-        PerformanceDB.attendance
+        PerformanceDB.attendance,
     ).join(
         PerformanceDB,
-        StudentDB.id == PerformanceDB.student_id
+        StudentDB.id == PerformanceDB.student_id,
+    ).filter(
+        PerformanceDB.course_id == course_id,
     )
-
-    if course_id:
-        query = query.filter(PerformanceDB.course_id == course_id)
-
-    if semester and semester.strip() and semester != "All Semesters":
-        query = query.join(
-            CourseDB,
-            CourseDB.id == PerformanceDB.course_id
-        ).filter(
-            CourseDB.semester == semester.strip()
-        )
 
     if department_id:
         query = query.filter(StudentDB.department_id == department_id)
 
-    # Restrict to the latest week only
     if week_start is not None:
         query = query.filter(
             PerformanceDB.created_at >= week_start,
             PerformanceDB.created_at < week_end,
         )
 
-    students = query.all()
-
-
     risk_students = []
-
-
-    for student in students:
-
-
-        # Grade risk
-
+    for student in query.all():
         grade_risk = 100 - float(student.grade)
-
-
-        # Attendance risk
-
         attendance_risk = 100 - float(student.attendance)
+        risk_score = (grade_risk * 0.7) + (attendance_risk * 0.3)
 
-
-
-        # Risk score
-
-        risk_score = (
-            (grade_risk * 0.7)
-            +
-            (attendance_risk * 0.3)
-        )
-
-
-
-        # Risk level
-        # Direct grade override: below 50 is always High risk
         if float(student.grade) < 50:
             risk_level = "High"
-
         elif risk_score >= 60:
             risk_level = "High"
-
         elif risk_score >= 45:
             risk_level = "Medium"
-
         else:
             risk_level = "Low"
 
-
-
-        # Only add risky students
-
         if risk_level != "Low":
-
-
             risk_students.append({
-
-                "Student ID":
-                    student.student_id,
-
-
-                "Student Name":
-                    student.student_name,
-
-
-                "Grade":
-                    student.grade,
-
-
-                "Attendance":
-                    student.attendance,
-
-
-                "Risk Score":
-                    round(risk_score, 2),
-
-
-                "Risk Level":
-                    risk_level
-
+                "Student ID": student.student_id,
+                "Student Name": student.student_name,
+                "Grade": student.grade,
+                "Attendance": student.attendance,
+                "Risk Score": round(risk_score, 2),
+                "Risk Level": risk_level,
             })
 
+    return risk_students
+
+
+def get_at_risk_students(
+    db,
+    course_id=None,
+    semester=None,
+    department_id=None,
+    user_id=None,
+):
+    """
+    Return at-risk students based ONLY on their most recent week's record.
+    Single course: that course's latest week.
+    All courses: combined at-risk students from each course's own latest week.
+    """
+    risk_students = []
+    for cid in _course_ids_in_scope(
+        db, course_id=course_id, semester=semester, user_id=user_id
+    ):
+        week_start, week_end = _latest_week_bounds(
+            db, course_id=cid, semester=semester, user_id=user_id
+        )
+        risk_students.extend(
+            _at_risk_students_for_course_week(
+                db, cid, week_start, week_end, department_id=department_id
+            )
+        )
 
     return risk_students
 def generate_recommendations(perf_dist, correlation, errors, prediction, at_risk_list):
@@ -1014,9 +1007,12 @@ def export_report(
         )
 
     if getattr(config, "include_benchmarks", False):
-        data["benchmarks"] = department_benchmarks(
+        bench_result = department_benchmarks(
             db, course_id, semester, days, from_date, to_date
         )
+        data["benchmarks"] = bench_result.get("benchmarks", [])
+        if bench_result.get("message"):
+            data["benchmarks_message"] = bench_result["message"]
 
     if getattr(config, "attendance_data", False):
         data["correlation"] = get_attendance_correlation_report(
@@ -1422,7 +1418,19 @@ def export_report(
         # BENCHMARKS
         # =====================================================
 
-        if (
+        if "benchmarks_message" in data and data["benchmarks_message"]:
+            elements.append(
+                Paragraph(
+                    "Department Benchmarks",
+                    section_style
+                )
+            )
+            elements.append(
+                Paragraph(data["benchmarks_message"], description_style)
+            )
+            elements.append(Spacer(1, 14))
+
+        elif (
             "benchmarks" in data
             and data["benchmarks"]
             and len(data["benchmarks"]) > 0
@@ -1801,7 +1809,13 @@ def export_report(
                     index=False
                 )
 
-            if "benchmarks" in data and data["benchmarks"]:
+            if data.get("benchmarks_message"):
+                pd.DataFrame([{"Message": data["benchmarks_message"]}]).to_excel(
+                    writer,
+                    sheet_name="Department Benchmarks",
+                    index=False,
+                )
+            elif "benchmarks" in data and data["benchmarks"]:
 
                 pd.DataFrame(data["benchmarks"]).to_excel(
                     writer,

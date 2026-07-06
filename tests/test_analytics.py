@@ -35,7 +35,9 @@ class TestAnalyticsEndpoints:
     def test_benchmarks_no_course(self, client):
         resp = client.get("/analysis/benchmarks?course_id=99999")
         assert resp.status_code == 200
-        assert resp.json() == []
+        data = resp.json()
+        assert data["benchmarks"] == []
+        assert data["message"] == "Course not found."
 
     def test_courses_list(self, client):
         resp = client.get("/analysis/courses")

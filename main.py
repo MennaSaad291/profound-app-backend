@@ -39,6 +39,7 @@ from routes import analysis, lecture
 from routes import courses as courses_router
 from file_utils import extract_text
 from services.grading_service import perform_nlp_grading
+from services import analytics_service
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
@@ -513,9 +514,11 @@ def get_dashboard_stats(user_id: int, db: Session = Depends(get_db)):
         all_grades = [g for grades in student_perf.values() for g in grades]
         class_average = round(sum(all_grades) / len(all_grades), 1) if all_grades else 0.0
 
-        at_risk_count = sum(
-            1 for grades in student_perf.values()
-            if (sum(grades) / len(grades)) < 50
+        # Latest week per course, combined across this professor's courses
+        at_risk_count = len(
+            analytics_service.get_at_risk_students(
+                db, course_id=None, user_id=user_id
+            )
         )
     else:
         # Fall back to graded submissions

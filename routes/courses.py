@@ -264,7 +264,7 @@ def get_course_analytics(course_id: int, db: Session = Depends(get_db)):
     trend = [round(sum(grades[i*chunk:(i+1)*chunk]) / len(grades[i*chunk:(i+1)*chunk]), 1)
              if grades[i*chunk:(i+1)*chunk] else avg for i in range(5)]
 
-    return {"average": f"{avg}%", "at_risk": sum(1 for g in grades if g < 60),
+    return {"average": f"{avg}%", "at_risk": sum(1 for g in grades if g < 50),
             "trend": trend, "distribution": dist}
 
 
