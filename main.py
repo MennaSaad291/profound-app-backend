@@ -64,7 +64,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY_ANALYSIS"))
+groq_client = None
+
+def _get_groq_client():
+    global groq_client
+    if groq_client is None:
+        groq_client = Groq(api_key=os.getenv("GROQ_API_KEY_ANALYSIS"))
+    return groq_client
 
 UPLOAD_DIR = "uploads/assignments"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -611,7 +617,7 @@ Return ONLY JSON with key "questions" containing exactly {request.number_of_ques
 The explanation field must describe WHY this question tests {request.blooms_level}-level thinking."""
 
     try:
-        completion = groq_client.chat.completions.create(
+        completion = _get_groq_client().chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a JSON-only academic exam generator. Strictly follow Bloom's taxonomy level instructions."},
@@ -848,7 +854,7 @@ RULES:
 Return ONLY JSON with key "questions":
 "question_text", "question_type", "options", "correct_answer", "explanation", "difficulty"
 """
-        completion = groq_client.chat.completions.create(
+        completion = _get_groq_client().chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a JSON-only academic exam generator. Strictly follow Bloom's taxonomy instructions."},

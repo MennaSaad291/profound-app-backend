@@ -3,7 +3,13 @@ import json
 from groq import Groq
 import re
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY_GRADING"))
+_client = None
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = Groq(api_key=os.getenv("GROQ_API_KEY_GRADING"))
+    return _client
 
 
 def extract_json_from_response(text: str) -> dict:
@@ -143,7 +149,7 @@ STUDENT ANSWER:
 """
 
     try:
-        response = client.chat.completions.create(
+        response = _get_client().chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
