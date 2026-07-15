@@ -1,0 +1,26 @@
+# Test files
+tests/
+run_tests.py
+pytest.ini
+check_models.py
+chk.py
+export_test.py
+inspect_pptx.py
+
+# Dev/local files
+.env
+.vscode/
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+
+# Uploaded files (runtime only, not needed at build)
+uploads/
+
+# Git
+.git/
